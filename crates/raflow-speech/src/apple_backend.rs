@@ -5,7 +5,7 @@
 //! 模組入口（`lib.rs`）已用 `#[cfg(target_os = "macos")]` 限定，這裡不再重複。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
@@ -23,8 +23,8 @@ use tokio::sync::oneshot;
 
 use crate::backend::SpeechBackend;
 use crate::whisper_backend::{
-    WhisperContext, is_safe_whisper_output, resolve_vad_model_path, rolling_tick_core,
-    strip_committed_prefix,
+    WhisperContext, is_safe_whisper_output, resolve_vad_model_path, rolling_final_flush_delivered,
+    rolling_tick_core, strip_committed_prefix,
 };
 
 /// Apple Speech 對單一 task 的 audio 上限為 1 分鐘（spec/whisper.md §7）。
@@ -315,6 +315,18 @@ fn should_correct_with_whisper(session_locale: &str, apple_final: &str) -> bool 
     session_locale == "zh-TW" && apple_final_has_english(apple_final)
 }
 
+/// 句級滾動是否對本 session 生效：需滾動能力齊備（flag + 閘門 + whisper）、
+/// VAD 模型檔實際存在、**且** zh-TW session。
+///
+/// - en-US session 一律不滾動——Whisper 強制 zh tokenizer，對英文音訊會幻覺或
+///   直接翻譯成中文（與 [`should_correct_with_whisper`] 的 locale 守門同一理由）；
+///   Apple 的 en-US 輸出本身已是正確英文，直出即可。
+/// - VAD 模型缺 → 不滾動：否則 callback 抑制 Apple final、`rolling_tick` 卻永遠
+///   no-op，整個 session 收不到任何 final（剪貼簿 / overlay 卡住）。
+fn rolling_session_active(rolling_capable: bool, vad_ready: bool, session_locale: &str) -> bool {
+    rolling_capable && vad_ready && session_locale == "zh-TW"
+}
+
 /// 呼叫 Apple 的 `SFSpeechRecognizer.requestAuthorization`，等候使用者回應後回傳結果。
 ///
 /// 由 `raflow-app` 於啟動時呼叫一次（見 `docs/spec/speech.md §3`）。
@@ -372,6 +384,19 @@ pub struct AppleSpeechBackend {
     // ── Phase 2 句級滾動（ADR-0006 §8.7.2）；rolling=false 時以下全不作用，行為同 HEAD ──
     /// 由 `RAFLOW_ROLLING` 決定（`with_rolling`）。預設 ON；`RAFLOW_ROLLING=0` → 停止時整段校正。
     rolling: bool,
+    /// 執行期校正閘門（menu「Whisper 智慧校正」開關，spec/settings.md §4）：
+    /// 回 false → Whisper 全不介入（滾動與整段終校皆跳過）。未注入 → 恆 ON。
+    correction_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// 本次 session 的閘門快照：`start()` 時讀一次、整個 session 固定——避免錄音
+    /// 中途切 OFF 造成「callback 已抑制 Apple final、tick 卻不再補送」的文字遺失。
+    session_correction: bool,
+    /// 本次 session 滾動是否生效（`start()` 時以 [`rolling_session_active`] 定案）：
+    /// 能力齊備、VAD 模型在、且 zh-TW session 才滾動。否則 Apple final 直出。
+    session_rolling: bool,
+    /// Apple 整段 final 是否抑制（與 callback 共享）。滾動 session 於 `start()` 設
+    /// true；收尾 flush **失敗**（守門拒收/空輸出/核心錯誤）時清為 false → 稍後
+    /// 抵達的 Apple final 以未定稿尾段回退直出，避免空 `Final` 清掉草稿（資料遺失）。
+    suppress_apple_final: Arc<AtomicBool>,
     /// 已定稿音訊的**結束樣本位置**（rolling_tick 游標；每次 start 歸零）。
     /// 以樣本位置而非段數：VAD 對成長中緩衝重切段時（合併/分裂），段數游標會指錯
     /// 音訊 → 已定稿內容被重複轉錄（實測「另外我們」重複、尾句 ×4）；樣本位置
@@ -410,6 +435,10 @@ impl AppleSpeechBackend {
             pcm_buffer: Arc::new(Mutex::new(Vec::new())),
             whisper: None,
             rolling: false,
+            correction_gate: None,
+            session_correction: true,
+            session_rolling: false,
+            suppress_apple_final: Arc::new(AtomicBool::new(false)),
             finalized_samples: 0,
             committed_chars: Arc::new(AtomicUsize::new(0)),
             apple_cumulative_chars: Arc::new(AtomicUsize::new(0)),
@@ -459,11 +488,20 @@ impl AppleSpeechBackend {
         self
     }
 
-    /// 滾動是否**實際生效**：需 flag ON 且已注入 whisper（rolling 靠 Whisper 定稿）。
-    /// 缺 whisper 時退化為現行行為——否則 callback 會抑制 Apple final 卻無 tick 補送 final，
-    /// 導致整個 session 收不到任何 final（剪貼簿 / overlay 卡住）。
+    /// Builder：注入執行期校正閘門（menu 開關，spec/settings.md §4）。閘門於每次
+    /// `start()` 讀一次快照（`session_correction`），回 false 時該 session 的 Whisper
+    /// 全不介入（滾動 + 整段終校皆跳過），Apple 輸出即最終輸出。
+    pub fn with_correction_gate(mut self, gate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.correction_gate = Some(gate);
+        self
+    }
+
+    /// 滾動是否**實際生效**：需 flag ON、session 閘門 ON、且已注入 whisper
+    /// （rolling 靠 Whisper 定稿）。缺 whisper 時退化為現行行為——否則 callback 會
+    /// 抑制 Apple final 卻無 tick 補送 final，導致整個 session 收不到任何 final
+    /// （剪貼簿 / overlay 卡住）。
     fn rolling_active(&self) -> bool {
-        self.rolling && self.whisper.is_some()
+        self.rolling && self.session_correction && self.whisper.is_some()
     }
 
     /// 以 16 kHz mono int16 PCM 為來源，建立 `AVAudioPCMBuffer`。
@@ -559,6 +597,18 @@ impl SpeechBackend for AppleSpeechBackend {
         self.transcript_tx = Some(transcript_tx.clone());
         // 滾動 prompt 術語（使用者檔優先；每 session 重讀，改檔下次錄音生效）。
         self.prompt_terms = load_prompt_terms();
+        // 校正閘門快照（menu「Whisper 智慧校正」，spec/settings.md §4）：session 內
+        // 固定，menu 切換於下一次錄音生效。
+        self.session_correction = self.correction_gate.as_ref().is_none_or(|g| g());
+        // 滾動的 session 定案：能力齊備、VAD 模型檔實際存在、且 zh-TW session
+        // （en-US 完全不過 Whisper；VAD 缺 → 退化整段校正）。
+        let vad_ready = self.vad_model_path.as_deref().is_some_and(|p| p.exists());
+        self.session_rolling =
+            rolling_session_active(self.rolling_active(), vad_ready, &self.locale);
+        // Apple final 抑制旗標與 session_rolling 同步；收尾 flush 失敗時由
+        // rolling_tick 清除 → callback 放行 Apple final 回退。
+        self.suppress_apple_final
+            .store(self.session_rolling, Ordering::Relaxed);
 
         // SAFETY: SFSpeechAudioBufferRecognitionRequest::new 為標準 NSObject init，無前置條件。
         let request = unsafe { SFSpeechAudioBufferRecognitionRequest::new() };
@@ -584,8 +634,13 @@ impl SpeechBackend for AppleSpeechBackend {
         let pcm_buffer = self.pcm_buffer.clone();
         let whisper = self.whisper.clone();
         // Phase 2 rolling：callback 依 rolling 決定是否裁切 partial 前綴、抑制 Apple final。
-        // 用 rolling_active（含 whisper 存在檢查）：缺 whisper 時退化為現行行為，避免收不到 final。
-        let rolling = self.rolling_active();
+        // 用 session_rolling（能力 + zh-TW locale 定案）：缺 whisper 或 en-US session
+        // 時退化為現行行為，避免收不到 final / 英文被 zh-Whisper 改寫。
+        let rolling = self.session_rolling;
+        // 閘門 OFF → 整段終校也跳過（所見即所得；spec/settings.md §1）。
+        let correction_on = self.session_correction;
+        // 收尾回退用：flush 失敗時 rolling_tick 清為 false → 放行 Apple final。
+        let suppress_apple_final = self.suppress_apple_final.clone();
         let committed_chars = self.committed_chars.clone();
         let apple_cumulative_chars = self.apple_cumulative_chars.clone();
         // Whisper 終校強制 zh tokenizer，只對 zh-TW session 有意義。en-US session 的
@@ -627,7 +682,20 @@ impl SpeechBackend for AppleSpeechBackend {
                 }
                 // rolling 模式：句級 tick 已負責定稿，抑制 Apple 整段 final（收尾 Final 由
                 // rolling_tick(is_final=true) 送，避免與 committed 前綴互相覆寫）。
+                // 例外——收尾 flush 失敗（守門拒收/空輸出/核心錯誤）時旗標已被清除：
+                // 以 Apple final 的**未定稿尾段**回退直出（不再過 Whisper，剛失敗過），
+                // printer 對齊草稿 → 不丟字、不清空（stop 流程先 flush 後 endAudio，
+                // Apple final 必然晚於 flush 抵達，旗標已定案）。
                 if rolling {
+                    if suppress_apple_final.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let tail = strip_committed_prefix(
+                        &apple_text,
+                        committed_chars.load(Ordering::Relaxed),
+                    );
+                    eprintln!("raflow: rolling 收尾回退 → Apple final 尾段直出");
+                    let _ = tx.send(TranscriptUpdate::Final(tail));
                     return;
                 }
                 // Final：條件觸發 Whisper 終校（spec/whisper.md §14）。只在 zh-TW session
@@ -636,6 +704,10 @@ impl SpeechBackend for AppleSpeechBackend {
                 // 幻覺蓋掉正確英文，後者避免改寫對的內容 + 省 ~2s。
                 let final_text = match whisper.as_ref() {
                     None => apple_text,
+                    Some(_) if !correction_on => {
+                        eprintln!("raflow: skip whisper (智慧校正 OFF via 設定)");
+                        apple_text
+                    }
                     Some(_) if !should_correct_with_whisper(&session_locale, &apple_text) => {
                         eprintln!(
                             "raflow: skip whisper (locale={session_locale}, non-zh session or pure Chinese)"
@@ -721,7 +793,7 @@ impl SpeechBackend for AppleSpeechBackend {
             // rolling 模式**不截斷**：從前端 drain 會位移 VAD 段索引、打亂 `finalized_samples` 游標；
             // 保留整段確保段索引穩定（長錄音記憶體成本為已知取捨，ADR-0006 §8.7.2；
             // ~2MB/min，典型聽寫可接受；未來以滑窗優化）。
-            if !self.rolling_active() {
+            if !self.session_rolling {
                 let max = MAX_PCM_SAMPLES_FOR_WHISPER;
                 if buf.len() > max * 3 / 2 {
                     let drop_n = buf.len() - max;
@@ -756,7 +828,7 @@ impl SpeechBackend for AppleSpeechBackend {
     ///
     /// 缺 `whisper` / VAD model / active sender 任一 → no-op（rolling 需三者齊備才生效）。
     fn rolling_tick(&mut self, is_final: bool) -> Result<(), RaflowError> {
-        if !self.rolling_active() {
+        if !self.session_rolling {
             return Ok(());
         }
         let (Some(whisper), Some(vad_path), Some(tx)) = (
@@ -791,8 +863,9 @@ impl SpeechBackend for AppleSpeechBackend {
             Err(e) => {
                 eprintln!("! rolling: tick core failed: {e}");
                 if is_final {
-                    // 收尾不可漏：printer 靠 Final 寫剪貼簿 + 排程 overlay hide。
-                    let _ = tx.send(TranscriptUpdate::Final(String::new()));
+                    // 收尾不可漏，但**不得送空 Final**（printer 會把未定稿草稿整段
+                    // backspace 清掉）→ 放行 Apple final 作回退（見 callback）。
+                    self.suppress_apple_final.store(false, Ordering::Relaxed);
                 }
                 return Ok(());
             }
@@ -800,6 +873,7 @@ impl SpeechBackend for AppleSpeechBackend {
         for t in &outcome.rejected {
             eprintln!("! rolling: whisper output rejected: {t:?}");
         }
+        let phrase_locked = outcome.phrase.is_some();
         if let Some(text) = outcome.phrase {
             let _ = tx.send(TranscriptUpdate::PhraseFinal(text));
             // **只有實際鎖定了句子才推進游標。** 被拒/空/錯 → 游標保留（音訊不丟失），
@@ -812,9 +886,19 @@ impl SpeechBackend for AppleSpeechBackend {
         }
 
         if is_final {
-            // 收尾：整段內容已由 PhraseFinal 鎖進 printer 的 committed；送空 Final 觸發
-            // 剪貼簿寫入（printer 端 = committed）與 overlay 排程 hide。
-            let _ = tx.send(TranscriptUpdate::Final(String::new()));
+            if rolling_final_flush_delivered(phrase_locked, outcome.pending_speech_samples) {
+                // 收尾：pending 語音已全數鎖進 printer 的 committed（或本無語音）；
+                // 送空 Final 觸發剪貼簿寫入（printer 端 = committed）與 overlay 排程 hide。
+                let _ = tx.send(TranscriptUpdate::Final(String::new()));
+            } else {
+                // 有 pending 語音卻沒鎖定（守門拒收/空輸出）→ 不送空 Final（會清掉
+                // 草稿），改放行 Apple final 以未定稿尾段回退（見 callback）。
+                eprintln!(
+                    "! rolling: 收尾 flush 未定稿（pending {} samples）→ 回退 Apple final",
+                    outcome.pending_speech_samples
+                );
+                self.suppress_apple_final.store(false, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -973,6 +1057,29 @@ mod tests {
                 eprintln!("skip: en-US unavailable on this host");
             }
             Err(other) => panic!("unexpected error switching locale: {other:?}"),
+        }
+    }
+
+    /// 句級滾動的 session 守門：en-US session 一律不滾動（Whisper 強制 zh tokenizer，
+    /// 對英文音訊會幻覺或直接翻譯成中文；實機回歸：英文輸入法說英文，停止後輸出變中文）；
+    /// VAD 模型檔不存在也不得滾動（否則 callback 抑制 Apple final、tick 卻永遠 no-op
+    /// → 整個 session 收不到 final）。
+    #[test]
+    fn rolling_session_active_requires_zh_tw_and_vad() {
+        let cases: &[(bool, bool, &str, bool)] = &[
+            (true, true, "zh-TW", true),   // 能力齊備 + VAD 在 + zh-TW → 滾動
+            (true, true, "en-US", false),  // en-US → 不滾動（Apple 英文直出）
+            (true, true, "ja-JP", false),  // 其他 locale 一律不滾動
+            (true, false, "zh-TW", false), // VAD 模型缺 → 不滾動（退化整段校正）
+            (false, true, "zh-TW", false), // 能力不齊（flag/閘門/whisper 缺）→ 不滾動
+            (false, false, "en-US", false),
+        ];
+        for (capable, vad_ready, locale, expected) in cases.iter().copied() {
+            assert_eq!(
+                rolling_session_active(capable, vad_ready, locale),
+                expected,
+                "rolling_session_active({capable}, {vad_ready}, {locale:?})"
+            );
         }
     }
 

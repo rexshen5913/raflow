@@ -5,12 +5,15 @@ members = ["crates/raflow-core", "crates/raflow-hotkey", "crates/raflow-audio", 
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["raflow maintainers"]
 license = "MIT"
 
 [workspace.dependencies]
 thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+arc-swap = "1.9"
 global-hotkey = "0.7"
 cpal = "0.17"
 tokio = { version = "1.52", default-features = false, features = ["sync"] }

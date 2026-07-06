@@ -319,6 +319,17 @@ pub struct RollingTickOutcome {
     pub rejected: Vec<String>,
     /// 新游標（已定稿音訊結束樣本位置）。僅在鎖定時前進，否則等於輸入值。
     pub finalized_samples: usize,
+    /// 本 tick 偵測到的未定稿語音量（samples）。收尾 flush 用
+    /// [`rolling_final_flush_delivered`] 判定是否需要回退 Apple final。
+    pub pending_speech_samples: usize,
+}
+
+/// 收尾 flush（`is_final=true`）是否已把 pending 語音全部交付：有鎖定句、或本來
+/// 就無 pending 語音 → 可安全送空 `Final` 觸發剪貼簿；否則呼叫端必須放行 Apple
+/// final 作回退——空 `Final` 會讓 printer 把未定稿草稿整段 backspace 清掉
+/// （守門拒收 / Whisper 空輸出 / VAD 失敗時的資料遺失路徑）。
+pub fn rolling_final_flush_delivered(phrase_locked: bool, pending_speech_samples: usize) -> bool {
+    phrase_locked || pending_speech_samples == 0
 }
 
 /// Phase 2 句級滾動**決策核心**（ADR-0006 §8.7.2）——`AppleSpeechBackend::rolling_tick`
@@ -344,6 +355,7 @@ pub fn rolling_tick_core(
         phrase: None,
         rejected: Vec::new(),
         finalized_samples,
+        pending_speech_samples: 0,
     };
     // VAD 只掃游標之後的音訊；相對範圍 +offset 還原絕對樣本位置。
     let offset = finalized_samples.min(pcm.len());
@@ -356,6 +368,7 @@ pub fn rolling_tick_core(
     let pending = segments_pending(&segments, finalized_samples);
     // 自適應門檻：未定稿語音累積越長，鎖定所需的段末靜音越短（真人節奏實證）。
     let pending_speech: usize = pending.iter().map(|r| r.end - r.start).sum();
+    out.pending_speech_samples = pending_speech;
     let segment_ends: Vec<usize> = pending.iter().map(|r| r.end).collect();
     let range = segments_ready_to_finalize(
         &segment_ends,
@@ -1237,6 +1250,28 @@ mod tests {
                 "segments_ready_to_finalize({ends:?}, {buf}, {finalized}, {SIL}, {is_final})"
             );
             assert!(r.start <= r.end && r.end <= ends.len(), "範圍越界: {r:?}");
+        }
+    }
+
+    /// 收尾 flush 的成敗判定：有鎖定句、或本來就無 pending 語音 → 已交付
+    /// （可安全送空 Final 觸發剪貼簿）；否則呼叫端必須放行 Apple final 回退——
+    /// 空 Final 會讓 printer 把未定稿草稿整段 backspace 清掉（資料遺失路徑：
+    /// 守門拒收 / Whisper 空輸出 / VAD 失敗時觸發）。
+    #[test]
+    fn rolling_final_flush_delivered_requires_lock_or_no_pending() {
+        let cases: &[(bool, usize, bool)] = &[
+            (true, 0, true),      // 有鎖定、無殘留 → 交付
+            (true, 16_000, true), // 有鎖定（is_final range 涵蓋全部 pending）→ 交付
+            (false, 0, true),     // 無鎖定但本來就無語音（靜音收尾）→ 交付（空 Final 無害）
+            (false, 1, false),    // 有 pending 語音卻沒鎖定（拒收/空輸出）→ 未交付，須回退
+            (false, 48_000, false),
+        ];
+        for (locked, pending, expected) in cases.iter().copied() {
+            assert_eq!(
+                rolling_final_flush_delivered(locked, pending),
+                expected,
+                "rolling_final_flush_delivered({locked}, {pending})"
+            );
         }
     }
 

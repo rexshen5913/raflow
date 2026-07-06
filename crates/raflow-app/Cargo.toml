@@ -24,6 +24,9 @@ raflow-audio = { path = "../raflow-audio" }
 raflow-speech = { path = "../raflow-speech" }
 raflow-input = { path = "../raflow-input" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+arc-swap.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tao.workspace = true

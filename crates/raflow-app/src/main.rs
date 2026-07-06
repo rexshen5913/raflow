@@ -30,9 +30,14 @@ mod floating_overlay;
 mod input_source;
 
 #[cfg(target_os = "macos")]
+mod settings;
+
+#[cfg(target_os = "macos")]
 mod mac {
     use crate::accessibility::{FocusDetection, detect_focus, ensure_trusted_with_prompt};
     use crate::floating_overlay::FloatingOverlay;
+    use crate::settings::{self, Settings};
+    use arc_swap::ArcSwap;
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     use raflow_app::{App, Transition};
@@ -42,18 +47,23 @@ mod mac {
         ArboardClipboard, ClipboardBackend, EnigoBackend, InputBackend, PhraseEvent, PhrasePrinter,
         Replacements, StreamDiff, apply_replacements, parse_replacements,
     };
-    use raflow_speech::{AppleSpeechBackend, WhisperContext, resolve_model_path, rolling_enabled};
+    use raflow_speech::{AppleSpeechBackend, WhisperContext, resolve_model_path};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
     use tao::event::{Event, StartCause};
     use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
     use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
     const LOCALE: &str = "zh-TW";
     const QUIT_MENU_ID: &str = "quit";
+    /// Menu 設定開關與「編輯…」項的 id（spec/settings.md §5）。
+    const MENU_ID_AUTO_LOCALE: &str = "settings.auto_locale";
+    const MENU_ID_WHISPER_CORRECTION: &str = "settings.whisper_correction";
+    const MENU_ID_EDIT_TERMS: &str = "edit.terms";
+    const MENU_ID_EDIT_REPLACEMENTS: &str = "edit.replacements";
     /// Whisper 餵的語言：強制 `zh` 中文 tokenizer，避免使用者反映的「偶爾出現韓文」
     /// （`auto` 模式下 Whisper 會自己 detect，相近 prosody 可能誤判 ko/ja）。
     /// 中英混合靠 `set_initial_prompt` 引導 + 結果 safety filter 雙保險。
@@ -356,29 +366,42 @@ mod mac {
         audio_tx: UnboundedSender<AudioFrame>,
         transcript_tx: UnboundedSender<TranscriptUpdate>,
         proxy: EventLoopProxy<UserEvent>,
+        user_settings: Arc<ArcSwap<Settings>>,
     ) -> Result<(), RaflowError> {
         let backend = AppleSpeechBackend::new(LOCALE)?;
         let backend = match try_load_whisper() {
             Some(ctx) => backend.with_whisper(ctx),
             None => backend,
         };
-        // Phase 2 句級滾動（RAFLOW_ROLLING）：預設 ON（經實機驗證後轉正）；
-        // RAFLOW_ROLLING=0 退回「停止時整段校正」。ON 需 whisper + VAD model 才生效；
-        // 缺則 rolling_tick no-op、退化為整段校正行為。
-        let rolling = rolling_enabled();
-        let backend = backend.with_rolling(rolling);
-        if rolling {
+        // Phase 2 句級滾動：由 menu「Whisper 智慧校正」開關控制（spec/settings.md §4，
+        // RAFLOW_ROLLING env 已於啟動時摺疊進 settings 初始值）。閘門每次錄音 start
+        // 讀值；OFF → 滾動與整段終校皆跳過（所見即所得）。需 whisper + VAD model
+        // 才生效；缺則 rolling_tick no-op、退化為整段校正行為。
+        let gate_settings = user_settings.clone();
+        let backend = backend
+            .with_rolling(true)
+            .with_correction_gate(Arc::new(move || gate_settings.load().whisper_correction));
+        if user_settings.load().whisper_correction {
             eprintln!(
-                "raflow: 句級滾動校正 ON（預設；需 whisper + VAD model）；\n  \
-                 每 {}ms 對已閉合語音段跑 Whisper 送 PhraseFinal。關閉：RAFLOW_ROLLING=0。",
+                "raflow: Whisper 智慧校正 ON（句級滾動；需 whisper + VAD model）；\n  \
+                 每 {}ms 對已閉合語音段跑 Whisper 送 PhraseFinal。可由 menu bar 切換。",
                 ROLLING_TICK_INTERVAL.as_millis()
             );
+        } else {
+            eprintln!("raflow: Whisper 智慧校正 OFF（所見即所得）；可由 menu bar 開啟。");
         }
-        // 每次錄音開始時讀當前輸入法 → 自動選 zh-TW / en-US（ADR-0007 / spec/speech.md §2）。
-        // backend 初始 locale 為 LOCALE（zh-TW）；首次 start 依輸入法切換。
+        // 每次錄音開始時決定 locale（ADR-0007 / spec/speech.md §2 / settings.md §4）：
+        // 「依輸入法自動切換」ON → 讀當前輸入法；OFF → 固定 zh-TW。
+        let locale_settings = user_settings.clone();
         let mut app: App<AppleSpeechBackend> = App::with_locale_provider(
             backend,
-            Box::new(crate::input_source::current_input_locale),
+            Box::new(move || {
+                if locale_settings.load().auto_locale {
+                    crate::input_source::current_input_locale()
+                } else {
+                    LOCALE.to_string()
+                }
+            }),
             LOCALE.to_string(), // fallback：preferred 語言 recognizer 不可用時退回 zh-TW
             transcript_tx,
         );
@@ -438,6 +461,7 @@ mod mac {
         audio_tx: UnboundedSender<AudioFrame>,
         transcript_tx: UnboundedSender<TranscriptUpdate>,
         proxy: EventLoopProxy<UserEvent>,
+        user_settings: Arc<ArcSwap<Settings>>,
     ) -> Result<(), RaflowError> {
         let rt = build_current_thread_rt()?;
         rt.block_on(worker_loop(
@@ -446,20 +470,71 @@ mod mac {
             audio_tx,
             transcript_tx,
             proxy,
+            user_settings,
         ))
     }
 
-    fn build_tray(idle_icon: Icon) -> Result<TrayIcon, RaflowError> {
-        let menu = Menu::new();
-        let quit_item = MenuItem::with_id(QUIT_MENU_ID, "Quit raflow", true, None);
-        menu.append(&quit_item)
-            .map_err(|e| RaflowError::AudioCapture {
+    /// Menu 設定開關的 handle：點擊事件時讀 `is_checked()` 回寫 ArcSwap + 檔案。
+    struct MenuHandles {
+        auto_locale: CheckMenuItem,
+        whisper_correction: CheckMenuItem,
+    }
+
+    fn build_tray(
+        idle_icon: Icon,
+        initial: Settings,
+    ) -> Result<(TrayIcon, MenuHandles), RaflowError> {
+        fn menu_err(e: impl std::fmt::Display) -> RaflowError {
+            RaflowError::AudioCapture {
                 detail: format!("failed to build tray menu: {e}"),
-            })?;
+            }
+        }
+        let menu = Menu::new();
+        // 版本標示（disabled）＋兩個設定開關＋設定檔捷徑＋結束（spec/settings.md §5）。
+        let version_item = MenuItem::new(
+            format!("raflow v{}", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        );
+        let auto_locale = CheckMenuItem::with_id(
+            MENU_ID_AUTO_LOCALE,
+            "依輸入法自動切換語言",
+            true,
+            initial.auto_locale,
+            None,
+        );
+        // 標示適用範圍（中文/中英混講）：en-US session 恆為 Apple 直出（其英文輸出
+        // 已是母語級，Whisper zh 管線不適用；spec/whisper.md §15 locale 守門），
+        // 勾選與否都不影響英文 session——選單文字必須誠實反映這一點。
+        let whisper_correction = CheckMenuItem::with_id(
+            MENU_ID_WHISPER_CORRECTION,
+            "Whisper 智慧校正（中文/中英混講）",
+            true,
+            initial.whisper_correction,
+            None,
+        );
+        let edit_terms = MenuItem::with_id(MENU_ID_EDIT_TERMS, "編輯自訂詞彙…", true, None);
+        let edit_replacements =
+            MenuItem::with_id(MENU_ID_EDIT_REPLACEMENTS, "編輯取代規則…", true, None);
+        let quit_item = MenuItem::with_id(QUIT_MENU_ID, "結束 raflow", true, None);
+
+        menu.append(&version_item).map_err(menu_err)?;
+        menu.append(&PredefinedMenuItem::separator())
+            .map_err(menu_err)?;
+        menu.append(&auto_locale).map_err(menu_err)?;
+        menu.append(&whisper_correction).map_err(menu_err)?;
+        menu.append(&PredefinedMenuItem::separator())
+            .map_err(menu_err)?;
+        menu.append(&edit_terms).map_err(menu_err)?;
+        menu.append(&edit_replacements).map_err(menu_err)?;
+        menu.append(&PredefinedMenuItem::separator())
+            .map_err(menu_err)?;
+        menu.append(&quit_item).map_err(menu_err)?;
+
         // Idle icon 走 template（黑白剪影，由 macOS 依 menu bar 明暗 tint）；
         // Recording icon 走全彩（要顯出真正的紅色錄音點），在 set_icon 時
         // 另行 set_icon_as_template(false) 關閉 tint。
-        TrayIconBuilder::new()
+        let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("raflow")
             .with_icon(idle_icon)
@@ -467,7 +542,81 @@ mod mac {
             .build()
             .map_err(|e| RaflowError::AudioCapture {
                 detail: format!("failed to build tray icon: {e}"),
-            })
+            })?;
+        Ok((
+            tray,
+            MenuHandles {
+                auto_locale,
+                whisper_correction,
+            },
+        ))
+    }
+
+    /// 使用者術語檔路徑（與 raflow-speech 的解析一致：env `RAFLOW_CONTEXTUAL_TERMS`
+    /// 覆寫，否則 Application Support）。供 menu「編輯自訂詞彙…」開啟。
+    fn contextual_terms_edit_path() -> Option<std::path::PathBuf> {
+        if let Some(p) = std::env::var_os("RAFLOW_CONTEXTUAL_TERMS") {
+            return Some(std::path::PathBuf::from(p));
+        }
+        let home = std::env::var_os("HOME")?;
+        let mut p = std::path::PathBuf::from(home);
+        p.push("Library");
+        p.push("Application Support");
+        p.push("raflow");
+        p.push("contextual_terms.txt");
+        Some(p)
+    }
+
+    const CONTEXTUAL_TERMS_TEMPLATE: &str = "\
+# raflow 自訂術語（每行一個；# 開頭為註解）
+#
+# 內建已涵蓋約 120 個常用術語（Kubernetes / Docker / AWS / Terraform /
+# PostgreSQL / ChatGPT…），這裡只需要放「內建沒有的、你自己常用的」詞。
+#
+# 最上方的詞優先進入 Whisper 修正提示（上限 20）——把最常被聽錯的放最前面。
+# 改完存檔後，下次「雙擊 Cmd 開始錄音」即生效，不必重啟 app。
+#
+# 範例（拿掉開頭的 # 即生效）：
+# Raycast
+# LangChain
+# 客戶專案代號
+";
+
+    const REPLACEMENTS_TEMPLATE: &str = "\
+# raflow 取代規則（每行：聽錯 => 正確；# 開頭為註解）
+#
+# 用途：對「穩定重現的誤認」做確定性修正——同一個詞每次都被聽成同一個
+# 錯法時，加一條規則一勞永逸。英文比對不分大小寫；長規則自動優先。
+# 改完存檔後，下次錄音即生效，不必重啟 app。
+#
+# 範例（拿掉開頭的 # 即生效）：
+# Teraphone => Terraform
+# 阿狗CD => ArgoCD
+";
+
+    /// menu「編輯…」動作：檔案不存在先建立範本，再交給預設文字編輯器開啟。
+    /// 失敗只記 log（menu 動作不可讓 app 崩潰）。
+    fn open_user_config(path: Option<std::path::PathBuf>, template: &str) {
+        let Some(path) = path else {
+            eprintln!("! 無法解析設定檔路徑（HOME 未設？）");
+            return;
+        };
+        if !path.exists() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&path, template) {
+                eprintln!("! 建立 {} 失敗: {e}", path.display());
+                return;
+            }
+        }
+        if let Err(e) = std::process::Command::new("open")
+            .arg("-t")
+            .arg(&path)
+            .spawn()
+        {
+            eprintln!("! 開啟 {} 失敗: {e}", path.display());
+        }
     }
 
     /// 設定 NSApplication 為 Accessory 模式：不占 Dock，但可在 menu bar 放 tray icon。
@@ -508,6 +657,16 @@ mod mac {
             let _ = proxy_for_menu.send_event(UserEvent::MenuClick(event.id.0.clone()));
         }));
 
+        // 使用者設定：檔案載入 + RAFLOW_ROLLING env 覆寫摺疊（spec/settings.md §3）。
+        // ArcSwap 共享（憲法 4.2）：worker 的閘門/locale provider 讀、menu 開關寫。
+        let initial_settings = settings::settings_path()
+            .as_deref()
+            .map(settings::load)
+            .unwrap_or_default()
+            .apply_env_override(std::env::var("RAFLOW_ROLLING").ok().as_deref());
+        let user_settings: Arc<ArcSwap<Settings>> =
+            Arc::new(ArcSwap::from_pointee(initial_settings));
+
         let (hotkey_tx, hotkey_rx) = unbounded_channel::<HotkeyEvent>();
         let (audio_tx, audio_rx) = unbounded_channel::<AudioFrame>();
         let (transcript_tx, transcript_rx) = unbounded_channel::<TranscriptUpdate>();
@@ -519,6 +678,7 @@ mod mac {
             .map_err(|e| spawn_error(format!("spawn printer thread: {e}")))?;
 
         let proxy_for_worker = proxy.clone();
+        let settings_for_worker = user_settings.clone();
         thread::Builder::new()
             .name("raflow-worker".into())
             .spawn(move || {
@@ -528,6 +688,7 @@ mod mac {
                     audio_tx,
                     transcript_tx,
                     proxy_for_worker,
+                    settings_for_worker,
                 ) {
                     report_error("worker exited with error", &err);
                 }
@@ -559,6 +720,8 @@ mod mac {
         // tray-icon 官方 doc 要求：「the earliest safe point is the StartCause::Init event」。
         // 在這之前 build 會讓 NSStatusItem 無法註冊到 NSStatusBar，icon 根本不會出現。
         let mut tray: Option<TrayIcon> = None;
+        // Menu 設定開關 handle：與 tray 同於 StartCause::Init 建立。
+        let mut menu_handles: Option<MenuHandles> = None;
         // FloatingOverlay 必須在主執行緒建（new() 內以 MainThreadMarker 驗證）；
         // 跟 tray 一起在 StartCause::Init 建。
         let mut overlay: Option<FloatingOverlay> = None;
@@ -578,8 +741,11 @@ mod mac {
 
             match event {
                 Event::NewEvents(StartCause::Init) => {
-                    match build_tray(idle_icon.clone()) {
-                        Ok(t) => tray = Some(t),
+                    match build_tray(idle_icon.clone(), **user_settings.load()) {
+                        Ok((t, handles)) => {
+                            tray = Some(t);
+                            menu_handles = Some(handles);
+                        }
                         Err(err) => report_error("failed to build menu bar tray icon", &err),
                     }
                     match FloatingOverlay::new() {
@@ -668,6 +834,41 @@ mod mac {
                     UserEvent::MenuClick(id) => {
                         if id == QUIT_MENU_ID {
                             *control_flow = ControlFlow::Exit;
+                        } else if id == MENU_ID_AUTO_LOCALE || id == MENU_ID_WHISPER_CORRECTION {
+                            // CheckMenuItem 點擊時 muda 已自動翻轉勾選狀態 →
+                            // 讀新狀態回寫 ArcSwap（下次錄音生效）+ 持久化到檔案。
+                            if let Some(handles) = menu_handles.as_ref() {
+                                let new_settings = Settings {
+                                    auto_locale: handles.auto_locale.is_checked(),
+                                    whisper_correction: handles
+                                        .whisper_correction
+                                        .is_checked(),
+                                };
+                                user_settings.store(Arc::new(new_settings));
+                                match settings::settings_path() {
+                                    Some(p) => {
+                                        if let Err(e) = settings::save(&p, new_settings) {
+                                            eprintln!(
+                                                "! settings 寫入失敗（in-memory 已生效）: {e}"
+                                            );
+                                        }
+                                    }
+                                    None => eprintln!(
+                                        "! settings 路徑無法解析（HOME 未設？），變更僅本次執行有效"
+                                    ),
+                                }
+                                eprintln!(
+                                    "raflow: 設定更新 — 自動語言切換={} / Whisper 智慧校正={}（下次錄音生效）",
+                                    new_settings.auto_locale, new_settings.whisper_correction
+                                );
+                            }
+                        } else if id == MENU_ID_EDIT_TERMS {
+                            open_user_config(
+                                contextual_terms_edit_path(),
+                                CONTEXTUAL_TERMS_TEMPLATE,
+                            );
+                        } else if id == MENU_ID_EDIT_REPLACEMENTS {
+                            open_user_config(replacements_path(), REPLACEMENTS_TEMPLATE);
                         }
                     }
                 },

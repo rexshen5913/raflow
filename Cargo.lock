@@ -66,6 +66,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "atk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2151,8 +2160,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raflow-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "arc-swap",
  "image",
  "objc2",
  "objc2-app-kit",
@@ -2164,6 +2174,8 @@ dependencies = [
  "raflow-hotkey",
  "raflow-input",
  "raflow-speech",
+ "serde",
+ "serde_json",
  "tao",
  "tokio",
  "tray-icon",
@@ -2171,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "raflow-audio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal",
  "raflow-core",
@@ -2180,14 +2192,14 @@ dependencies = [
 
 [[package]]
 name = "raflow-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "raflow-hotkey"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "block2",
  "objc2",
@@ -2199,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "raflow-input"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "enigo",
@@ -2208,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "raflow-speech"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "block2",
  "ferrous-opencc",
