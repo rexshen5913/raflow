@@ -1,0 +1,13 @@
+[package]
+name = "raflow-audio"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "raflow 麥克風擷取（16 kHz mono i16 PCM）"
+
+[dependencies]
+raflow-core.workspace = true
+cpal.workspace = true
+tokio.workspace = true

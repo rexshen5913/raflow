@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Template image for macOS menu bar (idle): pure black, alpha; system auto-tints -->
+<svg width="44" height="44" viewBox="0 0 44 44" xmlns="http://www.w3.org/2000/svg">
+  <!-- Hexagonal mic capsule (outlined, idle) -->
+  <g transform="translate(22, 19)" fill="none" stroke="black" stroke-width="2.4" stroke-linejoin="round">
+    <path d="M 0 -11 L 6 -7 L 6 7 L 0 11 L -6 7 L -6 -7 Z"/>
+    <!-- grille ticks -->
+    <line x1="-3.5" y1="-5" x2="3.5" y2="-5"/>
+    <line x1="-3.5" y1="-1" x2="3.5" y2="-1"/>
+    <line x1="-3.5" y1="3" x2="3.5" y2="3"/>
+  </g>
+  <!-- stand + base -->
+  <rect x="21" y="31" width="2" height="5" fill="black"/>
+  <rect x="15" y="35" width="14" height="2.6" rx="1" fill="black"/>
+</svg>

@@ -1,0 +1,47 @@
+[package]
+name = "raflow-speech"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "raflow Apple Speech Framework 整合（via objc2-speech）"
+
+[features]
+default = []
+# Phase 5：啟用 Whisper.cpp 終校（M1 + CoreML）。詳見 docs/spec/whisper.md。
+# 一併啟用 ferrous-opencc：句級滾動輸出簡→繁（zh-TW），見 docs/spec/whisper.md §15。
+whisper = ["dep:whisper-rs", "dep:ferrous-opencc"]
+
+# Phase 1 抗幻覺隔離 harness（見 docs/design/next-mixed-zh-en-streaming.md）。
+# 需 whisper feature（要真的載入 whisper + VAD 模型）。
+[[example]]
+name = "vad_harness"
+required-features = ["whisper"]
+
+# Phase 2 句級滾動離線模擬 harness：TTS 素材逐 tick 重放 rolling_tick_core，
+# 自動驗證句數/關鍵詞/無重複/命令字/游標/延遲。素材：make tts-fixtures。
+[[example]]
+name = "rolling_harness"
+required-features = ["whisper"]
+
+[dependencies]
+raflow-core.workspace = true
+tokio.workspace = true
+whisper-rs = { workspace = true, optional = true }
+ferrous-opencc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-speech = { workspace = true, features = [
+    "SFSpeechRecognizer",
+    "SFSpeechRecognitionRequest",
+    "SFSpeechRecognitionResult",
+    "SFSpeechRecognitionTask",
+    "SFTranscription",
+    "block2",
+    "objc2-avf-audio",
+] }
+objc2-avf-audio = { workspace = true, features = ["AVAudioFormat", "AVAudioBuffer", "AVAudioTypes"] }
+objc2-foundation = { workspace = true, features = ["NSLocale", "NSString", "NSError", "NSObject", "NSArray", "block2"] }
+block2.workspace = true

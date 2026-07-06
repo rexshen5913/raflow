@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Full-color recording indicator：亮洋紅 mic + 顯眼紅色錄音點（非 template，不被 macOS tint） -->
+<svg width="44" height="44" viewBox="0 0 44 44" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="recDot" cx="50%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#FF8B9A"/>
+      <stop offset="60%" stop-color="#FF2040"/>
+      <stop offset="100%" stop-color="#C80020"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Mic body：solid 亮洋紅 hex -->
+  <g transform="translate(22, 19)">
+    <path d="M 0 -11 L 6 -7 L 6 7 L 0 11 L -6 7 L -6 -7 Z" fill="#FF00E5"/>
+  </g>
+  <!-- stand + base -->
+  <rect x="21" y="31" width="2" height="5" fill="#FF00E5"/>
+  <rect x="15" y="35" width="14" height="3" rx="1" fill="#FF00E5"/>
+
+  <!-- Recording red dot（大到 22x22 render 還清楚可見）-->
+  <circle cx="34" cy="10" r="8" fill="url(#recDot)"/>
+  <circle cx="34" cy="10" r="8" fill="none" stroke="#FFFFFF" stroke-width="1.2" opacity="0.75"/>
+</svg>

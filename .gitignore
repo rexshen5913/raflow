@@ -1,0 +1,30 @@
+/target
+/dist
+
+/ui/node_modules
+/ui/dist
+
+/plugins/tauri-plugin-apple-speech/macos/.build
+
+# Icons: SVG 是原始檔；.icns + menu bar PNG 由 `make icons` 產出，
+# 因 main.rs include_bytes! 需要在 build 時存在，所以入 repo。
+# 中間產物 .iconset/ 每次重跑 make icons 都會重建，不入 repo。
+/packaging/icons/icon.iconset/
+
+.DS_Store
+*.swp
+*.swo
+
+.env
+.env.local
+
+# 一次性 / scratch 文件，不入 repo（個人筆記、暫時的架構說明等）
+/docs/intro.md
+
+# 本機語音測試素材（個人聲音錄音，含隱私，不入 repo）。
+# Phase 1 驗證用；使用者自備，不作為可提交 fixture。
+/中英混雜.m4a
+*.m4a
+
+# 滾動離線 harness 的 TTS 合成素材（make tts-fixtures 可隨時重生，不入 repo）
+/testdata/

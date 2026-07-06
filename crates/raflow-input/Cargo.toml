@@ -1,0 +1,15 @@
+[package]
+name = "raflow-input"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "raflow 文字注入（macOS CGEvent via enigo）"
+
+[dependencies]
+raflow-core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+enigo.workspace = true
+arboard.workspace = true

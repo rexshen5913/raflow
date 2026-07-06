@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/raflow-core", "crates/raflow-hotkey", "crates/raflow-audio", "crates/raflow-speech", "crates/raflow-input", "crates/raflow-app"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+version = "0.1.0"
+authors = ["raflow maintainers"]
+license = "MIT"
+
+[workspace.dependencies]
+thiserror = "2.0"
+global-hotkey = "0.7"
+cpal = "0.17"
+tokio = { version = "1.52", default-features = false, features = ["sync"] }
+tao = "0.35"
+enigo = "0.6"
+tray-icon = "0.22"
+arboard = "3.6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+objc2 = "0.6"
+objc2-speech = "0.3"
+objc2-avf-audio = "0.3"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-application-services = "0.3"
+objc2-core-foundation = "0.3"
+block2 = "0.6"
+# Metal（GGML_METAL_EMBED_LIBRARY，shader 內嵌 binary）：encoder+decoder 全走 M1 GPU，
+# 支援 q5_0 量化（large-v3-turbo）；取代原 CoreML encoder 路線
+# （CoreML 對 large 級模型首次 ANE 編譯要數分鐘，且 decoder 仍留在 CPU/BLAS）。
+whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }
+# 純 Rust OpenCC（無 C 依賴、字典內嵌）：句級滾動路徑的 Whisper 輸出簡→繁（zh-TW）。
+# 滾動用的 transcribe_streaming 刻意不帶 initial_prompt（ADR-0006 §5 幻覺主因），故無繁體
+# 導向 → 以確定性後轉換補上，零幻覺風險。詳見 docs/spec/whisper.md §15。
+ferrous-opencc = "0.4"
+raflow-core = { path = "crates/raflow-core" }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

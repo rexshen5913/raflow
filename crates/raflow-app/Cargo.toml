@@ -1,0 +1,67 @@
+[package]
+name = "raflow-app"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "raflow 主程式（Phase 4: CLI 原型；Phase 6 擴充為 Tauri）"
+
+[[bin]]
+name = "raflow"
+path = "src/main.rs"
+
+[features]
+default = []
+# Phase 5：透傳 whisper feature 到 raflow-speech，讓 final 文字走 Whisper 終校。
+# 詳見 docs/spec/whisper.md。
+whisper = ["raflow-speech/whisper"]
+
+[dependencies]
+raflow-core.workspace = true
+raflow-hotkey = { path = "../raflow-hotkey" }
+raflow-audio = { path = "../raflow-audio" }
+raflow-speech = { path = "../raflow-speech" }
+raflow-input = { path = "../raflow-input" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tao.workspace = true
+tray-icon.workspace = true
+image.workspace = true
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
+    "NSResponder",
+    "NSPanel",
+    "NSWindow",
+    "NSTextField",
+    "NSText",
+    "NSView",
+    "NSControl",
+    "NSColor",
+    "NSScreen",
+    "NSGraphics",
+    "NSAttributedString",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSParagraphStyle",
+] }
+objc2-foundation = { workspace = true, features = [
+    "NSThread",
+    "NSGeometry",
+    "NSString",
+    "NSAttributedString",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSDate",
+    "NSObject",
+] }
+objc2-application-services = { workspace = true, features = [
+    "AXUIElement",
+    "AXError",
+] }
+objc2-core-foundation = { workspace = true, features = [
+    "CFBase",
+    "CFString",
+] }

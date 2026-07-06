@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>dev.raflow.raflow</string>
+
+    <key>CFBundleName</key>
+    <string>raflow</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>raflow</string>
+
+    <key>CFBundleExecutable</key>
+    <string>raflow</string>
+
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
+
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+
+    <!-- Agent app：不在 Dock 出現，也不在 Cmd+Tab 顯示；以 global hotkey 為唯一觸發介面。 -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- 授權文案 —— 權限彈窗會顯示於此；用字應說明為何需要該權限。 -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>raflow 需要麥克風，才能擷取您的語音以供辨識。</string>
+
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>raflow 使用 Apple Speech 將您的語音轉寫為文字，並注入到您目前聚焦的輸入框。</string>
+
+    <!-- macOS 14+ 對 NSEvent global monitor 偵測 key event（用於雙擊 Cmd）可能要求此權限。 -->
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>raflow 需要監看鍵盤事件，才能偵測您雙擊 Cmd 觸發語音輸入。</string>
+</dict>
+</plist>

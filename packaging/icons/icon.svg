@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#140804"/>
+      <stop offset="55%" stop-color="#2E1306"/>
+      <stop offset="100%" stop-color="#4F1E09"/>
+    </linearGradient>
+    <linearGradient id="neon" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFD400"/>
+      <stop offset="55%" stop-color="#FF6B1F"/>
+      <stop offset="100%" stop-color="#FF1A6E"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="50%" cy="48%" r="60%">
+      <stop offset="0%" stop-color="#FFD400" stop-opacity="0.32"/>
+      <stop offset="60%" stop-color="#FF6B1F" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#FF1A6E" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="waveLeft" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#FFD400" stop-opacity="0.1"/>
+      <stop offset="100%" stop-color="#FFD400" stop-opacity="1"/>
+    </linearGradient>
+    <linearGradient id="waveRight" x1="1" y1="0" x2="0" y2="0">
+      <stop offset="0%" stop-color="#FF1A6E" stop-opacity="0.1"/>
+      <stop offset="100%" stop-color="#FF1A6E" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background (macOS icon corner radius ~180/1024) -->
+  <rect width="1024" height="1024" rx="180" ry="180" fill="url(#bg)"/>
+
+  <!-- Cyber grid -->
+  <g opacity="0.22">
+    <g stroke="#FF6B1F" stroke-width="2">
+      <line x1="0" y1="170" x2="1024" y2="170"/>
+      <line x1="0" y1="340" x2="1024" y2="340"/>
+      <line x1="0" y1="510" x2="1024" y2="510"/>
+      <line x1="0" y1="680" x2="1024" y2="680"/>
+      <line x1="0" y1="850" x2="1024" y2="850"/>
+    </g>
+    <g stroke="#FFD400" stroke-width="2">
+      <line x1="170" y1="0" x2="170" y2="1024"/>
+      <line x1="340" y1="0" x2="340" y2="1024"/>
+      <line x1="510" y1="0" x2="510" y2="1024"/>
+      <line x1="680" y1="0" x2="680" y2="1024"/>
+      <line x1="850" y1="0" x2="850" y2="1024"/>
+    </g>
+  </g>
+
+  <!-- Halo behind mic -->
+  <circle cx="512" cy="480" r="420" fill="url(#halo)"/>
+
+  <!-- Waveform bars (left: amber) -->
+  <g>
+    <rect x="96"  y="472" width="22" height="80"  rx="8" fill="url(#waveLeft)" opacity="0.85"/>
+    <rect x="150" y="422" width="22" height="180" rx="8" fill="url(#waveLeft)" opacity="0.7"/>
+    <rect x="204" y="392" width="22" height="240" rx="8" fill="url(#waveLeft)" opacity="0.55"/>
+    <rect x="258" y="442" width="22" height="140" rx="8" fill="url(#waveLeft)" opacity="0.4"/>
+  </g>
+
+  <!-- Waveform bars (right: hot pink) -->
+  <g>
+    <rect x="744" y="442" width="22" height="140" rx="8" fill="url(#waveRight)" opacity="0.4"/>
+    <rect x="798" y="392" width="22" height="240" rx="8" fill="url(#waveRight)" opacity="0.55"/>
+    <rect x="852" y="422" width="22" height="180" rx="8" fill="url(#waveRight)" opacity="0.7"/>
+    <rect x="906" y="472" width="22" height="80"  rx="8" fill="url(#waveRight)" opacity="0.85"/>
+  </g>
+
+  <!-- Hexagonal mic capsule -->
+  <g transform="translate(512, 460)">
+    <!-- hex body -->
+    <path d="M 0 -280
+             L 152 -192
+             L 152 192
+             L 0 280
+             L -152 192
+             L -152 -192 Z"
+          fill="#1A0804" stroke="url(#neon)" stroke-width="18" stroke-linejoin="round"/>
+    <!-- grille -->
+    <g stroke="#FFD400" stroke-width="10" stroke-linecap="round" opacity="0.95">
+      <line x1="-82" y1="-150" x2="82" y2="-150"/>
+      <line x1="-94" y1="-80"  x2="94" y2="-80"/>
+      <line x1="-100" y1="-10" x2="100" y2="-10"/>
+      <line x1="-94" y1="60"   x2="94" y2="60"/>
+      <line x1="-82" y1="130"  x2="82" y2="130"/>
+    </g>
+    <!-- hot pink accent slash -->
+    <line x1="-82" y1="200" x2="82" y2="200" stroke="#FF1A6E" stroke-width="12" stroke-linecap="round"/>
+  </g>
+
+  <!-- Mic stand -->
+  <rect x="496" y="740" width="32" height="86" fill="url(#neon)" opacity="0.92"/>
+
+  <!-- Mic base (angular trapezoid) -->
+  <path d="M 340 826
+           L 684 826
+           L 640 900
+           L 384 900 Z"
+        fill="url(#neon)"/>
+
+  <!-- Highlight accent on base -->
+  <path d="M 376 832 L 648 832" stroke="#FFD400" stroke-width="6" stroke-linecap="round" opacity="0.7"/>
+
+  <!-- Subtle top-right glitch triangle -->
+  <path d="M 900 80 L 980 80 L 940 150 Z" fill="#FF1A6E" opacity="0.35"/>
+  <path d="M 920 96 L 960 96 L 940 132 Z" fill="#FFD400" opacity="0.55"/>
+
+  <!-- Subtle bottom-left glitch triangle -->
+  <path d="M 44 880 L 120 880 L 82 950 Z" fill="#FFD400" opacity="0.35"/>
+  <path d="M 60 896 L 104 896 L 82 932 Z" fill="#FF1A6E" opacity="0.55"/>
+</svg>

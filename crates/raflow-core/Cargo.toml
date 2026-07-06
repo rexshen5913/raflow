@@ -1,0 +1,11 @@
+[package]
+name = "raflow-core"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "共用型別、錯誤、設定"
+
+[dependencies]
+thiserror.workspace = true
