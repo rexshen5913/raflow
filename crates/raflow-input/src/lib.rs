@@ -56,7 +56,7 @@ pub fn parse_replacements(contents: &str) -> Replacements {
             Some((from.to_string(), to.to_string()))
         })
         .collect();
-    rules.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+    rules.sort_by_key(|(from, _)| std::cmp::Reverse(from.chars().count()));
     rules
 }
 
