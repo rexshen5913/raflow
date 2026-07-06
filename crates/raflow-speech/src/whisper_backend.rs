@@ -394,20 +394,25 @@ pub fn rolling_tick_core(
 
 /// whisper.cpp encoder：1 個 audio-ctx token = 20ms = 320 samples @16kHz（30s 視窗
 /// = 480_000 samples = 1500 tokens）。
+#[cfg(any(feature = "whisper", test))]
 const SAMPLES_PER_AUDIO_CTX_TOKEN: usize = 320;
 /// encoder 滿視窗 tokens（30s）。`audio_ctx` 上限；超長音訊由 `full()` 內部分窗。
+#[cfg(any(feature = "whisper", test))]
 const AUDIO_CTX_MAX: i32 = 1_500;
 /// `audio_ctx` 下限：**離線 harness 實證**（rolling_harness）——下限 256 會讓
 /// turbo 輸出退化——句內 ×2 重複（「接下來是第二句話」×2）與後半截斷（「…會使用」
 /// 掉尾）；512 全場景乾淨且比滿視窗快 2~3 倍（鎖定 ~350-480ms vs ~1050ms）。
+#[cfg(any(feature = "whisper", test))]
 const AUDIO_CTX_MIN: i32 = 512;
 /// 換算後的安全餘裕 tokens（避免語音貼齊視窗邊緣被截斷）。
+#[cfg(any(feature = "whisper", test))]
 const AUDIO_CTX_MARGIN: i32 = 64;
 
 /// 依音訊樣本數換算 `FullParams::set_audio_ctx` 的 encoder 視窗 tokens（延遲優化，
 /// spec/whisper.md §16）：`clamp(ceil(samples/320) + 餘裕, 下限, 1500)`。
 /// whisper.cpp 對任意長度輸入都補零到 30s 跑滿 encoder；turbo 的 encoder 是 large 級，
 /// 對滾動尾句（2~5s）是每次 ~10 倍的固定浪費——裁到實際長度即省。
+#[cfg(any(feature = "whisper", test))]
 pub fn audio_ctx_for_samples(samples: usize) -> i32 {
     let needed = samples.div_ceil(SAMPLES_PER_AUDIO_CTX_TOKEN);
     let needed = i32::try_from(needed).unwrap_or(AUDIO_CTX_MAX);
