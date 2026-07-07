@@ -3,6 +3,8 @@
 BUNDLE_DIR := target/release/raflow.app
 BUNDLE_BIN := $(BUNDLE_DIR)/Contents/MacOS/raflow
 BUNDLE_PLIST := $(BUNDLE_DIR)/Contents/Info.plist
+# bundle 版本一律取自 workspace Cargo.toml（避免 Info.plist 版本與 crate 版本漂移）
+VERSION := $(shell grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 BUNDLE_RES := $(BUNDLE_DIR)/Contents/Resources
 # self-signed dev cert：所有 rebuild 用同一顆 cert 才能讓 macOS TCC 記住權限
 DEV_CERT_NAME := raflow-dev
@@ -74,6 +76,8 @@ bundle: icons dev-cert
 	mkdir -p "$(BUNDLE_DIR)/Contents/MacOS" "$(BUNDLE_RES)"
 	cp target/release/raflow "$(BUNDLE_BIN)"
 	cp packaging/Info.plist "$(BUNDLE_PLIST)"
+	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" "$(BUNDLE_PLIST)"
+	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" "$(BUNDLE_PLIST)"
 	cp "$(APP_ICON)" "$(BUNDLE_RES)/icon.icns"
 	codesign --force --deep --sign "$(DEV_CERT_NAME)" "$(BUNDLE_DIR)"
 	@echo ""
@@ -104,6 +108,8 @@ bundle-whisper: icons dev-cert
 	mkdir -p "$(BUNDLE_DIR)/Contents/MacOS" "$(BUNDLE_RES)"
 	cp target/release/raflow "$(BUNDLE_BIN)"
 	cp packaging/Info.plist "$(BUNDLE_PLIST)"
+	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" "$(BUNDLE_PLIST)"
+	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" "$(BUNDLE_PLIST)"
 	cp "$(APP_ICON)" "$(BUNDLE_RES)/icon.icns"
 	codesign --force --deep --sign "$(DEV_CERT_NAME)" "$(BUNDLE_DIR)"
 	@echo ""
