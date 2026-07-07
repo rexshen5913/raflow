@@ -22,6 +22,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::backend::SpeechBackend;
+use crate::term_restore::restore_terms;
 use crate::whisper_backend::{
     WhisperContext, is_safe_whisper_output, resolve_vad_model_path, rolling_final_flush_delivered,
     rolling_tick_core, strip_committed_prefix,
@@ -245,9 +246,29 @@ fn load_contextual_terms() -> Vec<String> {
     merge_contextual_terms(DEFAULT_CONTEXTUAL_TERMS, user.as_deref())
 }
 
+/// 術語還原診斷 trace 開關 `RAFLOW_RESTORE_TRACE` 的純解析（**預設 OFF**，opt-in）。
+///
+/// 語意：只有明確 truthy 值（`1`/`true`/`yes`/`on`，忽略大小寫、去前後空白）→ ON；
+/// 未設 / 空 / 其餘任何值 → OFF。與 [`parse_rolling_flag`] 極性相反——trace 會印出
+/// 使用者口述全文（Whisper 定稿 + Apple 草稿）供 spec/whisper.md §18 錯例萃取，
+/// 故**預設不輸出**，避免敏感內容落入 stderr／log（Codex stop-review）。
+/// 抽成純函式讓測試不碰 process 全域 env（憲法 §2.4）；env 讀取見 [`restore_trace_enabled`]。
+fn parse_restore_trace_flag(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// 讀 `RAFLOW_RESTORE_TRACE` env 決定是否啟用術語還原診斷 trace（預設 OFF）。
+/// 薄層包裝 [`parse_restore_trace_flag`]（後者已測）；本函式只做 env I/O，不另測。
+fn restore_trace_enabled() -> bool {
+    parse_restore_trace_flag(std::env::var("RAFLOW_RESTORE_TRACE").ok().as_deref())
+}
+
 /// 滾動 prompt priming 的核心預設術語（離線 harness 以真人錄音 + TTS 驗證過的
 /// 高價值詞——ArgoCD/GitLab CI/IaC/Terraform 實測由錯轉對）。刻意不用完整
-/// `DEFAULT_CONTEXTUAL_TERMS`（~118 詞）：prompt 上限 20，全塞會稀釋偏置且把
+/// `DEFAULT_CONTEXTUAL_TERMS`（~118 詞）：prompt 上限 30，全塞會稀釋偏置且把
 /// 使用者詞擠出去。
 const DEFAULT_PROMPT_TERMS: &[&str] = &[
     "ArgoCD",
@@ -261,7 +282,7 @@ const DEFAULT_PROMPT_TERMS: &[&str] = &[
     "Docker",
 ];
 
-/// 組滾動 prompt 術語：**使用者檔案詞優先**（自家詞最常被聽錯，須佔住 20 上限的
+/// 組滾動 prompt 術語：**使用者檔案詞優先**（自家詞最常被聽錯，須佔住 30 上限的
 /// 前排），再補核心預設；保序去重、跳過註解/空行。上限裁切由
 /// `build_rolling_prompt`（whisper_backend）執行。
 fn prompt_terms_user_first(user_file: Option<&str>) -> Vec<String> {
@@ -397,6 +418,15 @@ pub struct AppleSpeechBackend {
     /// true；收尾 flush **失敗**（守門拒收/空輸出/核心錯誤）時清為 false → 稍後
     /// 抵達的 Apple final 以未定稿尾段回退直出，避免空 `Final` 清掉草稿（資料遺失）。
     suppress_apple_final: Arc<AtomicBool>,
+    /// 最新的 Apple cumulative partial 全文（callback 寫、rolling_tick 讀）：
+    /// 術語還原（spec/whisper.md §18）需要「同段音訊的 Apple 草稿」做對齊來源。
+    apple_partial_text: Arc<Mutex<String>>,
+    /// 術語還原用詞彙表（內建 + 使用者檔**全部**，不受 prompt 上限約束；每 session 重讀）。
+    restore_vocab: Vec<String>,
+    /// 術語還原診斷 trace 開關（`RAFLOW_RESTORE_TRACE`，**預設 OFF**；每 session start 重讀）。
+    /// ON 時每次 phrase-final 把 Whisper 定稿與 Apple 草稿印到 stderr，供 §18 錯例萃取。
+    /// 含使用者口述全文，故 opt-in、預設不輸出（見 [`parse_restore_trace_flag`]）。
+    restore_trace: bool,
     /// 已定稿音訊的**結束樣本位置**（rolling_tick 游標；每次 start 歸零）。
     /// 以樣本位置而非段數：VAD 對成長中緩衝重切段時（合併/分裂），段數游標會指錯
     /// 音訊 → 已定稿內容被重複轉錄（實測「另外我們」重複、尾句 ×4）；樣本位置
@@ -439,6 +469,9 @@ impl AppleSpeechBackend {
             session_correction: true,
             session_rolling: false,
             suppress_apple_final: Arc::new(AtomicBool::new(false)),
+            apple_partial_text: Arc::new(Mutex::new(String::new())),
+            restore_vocab: Vec::new(),
+            restore_trace: false,
             finalized_samples: 0,
             committed_chars: Arc::new(AtomicUsize::new(0)),
             apple_cumulative_chars: Arc::new(AtomicUsize::new(0)),
@@ -597,6 +630,14 @@ impl SpeechBackend for AppleSpeechBackend {
         self.transcript_tx = Some(transcript_tx.clone());
         // 滾動 prompt 術語（使用者檔優先；每 session 重讀，改檔下次錄音生效）。
         self.prompt_terms = load_prompt_terms();
+        // 術語還原詞彙表（§18）：內建 + 使用者檔全部（與 contextualStrings 同一來源）。
+        self.restore_vocab = load_contextual_terms();
+        // 術語還原診斷 trace 開關每 session 重讀（RAFLOW_RESTORE_TRACE，預設 OFF）。
+        self.restore_trace = restore_trace_enabled();
+        // 清空上一輪的 Apple partial 快照。
+        if let Ok(mut t) = self.apple_partial_text.lock() {
+            t.clear();
+        }
         // 校正閘門快照（menu「Whisper 智慧校正」，spec/settings.md §4）：session 內
         // 固定，menu 切換於下一次錄音生效。
         self.session_correction = self.correction_gate.as_ref().is_none_or(|g| g());
@@ -641,6 +682,8 @@ impl SpeechBackend for AppleSpeechBackend {
         let correction_on = self.session_correction;
         // 收尾回退用：flush 失敗時 rolling_tick 清為 false → 放行 Apple final。
         let suppress_apple_final = self.suppress_apple_final.clone();
+        // 術語還原（§18）的對齊來源：callback 每個 partial 更新全文快照。
+        let apple_partial_text = self.apple_partial_text.clone();
         let committed_chars = self.committed_chars.clone();
         let apple_cumulative_chars = self.apple_cumulative_chars.clone();
         // Whisper 終校強制 zh tokenizer，只對 zh-TW session 有意義。en-US session 的
@@ -671,6 +714,11 @@ impl SpeechBackend for AppleSpeechBackend {
                 if !is_final {
                     // 記錄 Apple cumulative 長度（char），供 rolling_tick 定稿時快照為已鎖定前綴。
                     apple_cumulative_chars.store(apple_text.chars().count(), Ordering::Relaxed);
+                    // 全文快照供術語還原對齊（§18）；poisoned → 跳過（還原自動退化為 no-op）。
+                    if let Ok(mut t) = apple_partial_text.lock() {
+                        t.clear();
+                        t.push_str(&apple_text);
+                    }
                     // rolling：裁掉已鎖定前綴，只送當前句草稿（§2.2）；非 rolling：原樣送整段。
                     let draft = if rolling {
                         strip_committed_prefix(&apple_text, committed_chars.load(Ordering::Relaxed))
@@ -875,7 +923,24 @@ impl SpeechBackend for AppleSpeechBackend {
         }
         let phrase_locked = outcome.phrase.is_some();
         if let Some(text) = outcome.phrase {
-            let _ = tx.send(TranscriptUpdate::PhraseFinal(text));
+            // 術語還原（spec/whisper.md §18）：以同段音訊的 Apple 草稿對齊，
+            // Apple 認對（contextualStrings 命中）而 Whisper 改壞的術語 → 還原。
+            // 守門在 restore_terms 內（對不齊/無命中 → 原句返回，永不變更中文）。
+            let apple_draft = self
+                .apple_partial_text
+                .lock()
+                .map(|t| strip_committed_prefix(&t, self.committed_chars.load(Ordering::Relaxed)))
+                .unwrap_or_default();
+            // 術語還原診斷 trace（opt-in `RAFLOW_RESTORE_TRACE`，預設 OFF）：印出對齊的兩側
+            // 輸入讓「漏還原」現形，供 §18 錯例萃取。含口述全文，故預設不輸出（Codex review）。
+            if self.restore_trace {
+                eprintln!("raflow: [restore-trace] whisper={text:?} apple={apple_draft:?}");
+            }
+            let restored = restore_terms(&text, &apple_draft, &self.restore_vocab);
+            if restored != text {
+                eprintln!("raflow: 術語還原 {text:?} → {restored:?}");
+            }
+            let _ = tx.send(TranscriptUpdate::PhraseFinal(restored));
             // **只有實際鎖定了句子才推進游標。** 被拒/空/錯 → 游標保留（音訊不丟失），
             // 下次停頓以更長 span（更多上下文）重試。committed_chars 同理只在鎖定時
             // 推進（否則每 tick 裁掉當前句草稿，造成畫面重複清空重寫）；鎖定發生在使用者「停頓」
@@ -911,7 +976,7 @@ impl SpeechBackend for AppleSpeechBackend {
 mod tests {
     use super::*;
 
-    /// 滾動 prompt 術語選擇：**使用者檔案詞優先**（自家詞最常被聽錯，上限 20 內
+    /// 滾動 prompt 術語選擇：**使用者檔案詞優先**（自家詞最常被聽錯，上限 30 內
     /// 必須排前面），再補核心預設；保序去重、跳過註解/空行。
     #[test]
     fn prompt_terms_user_first_orders_and_dedups() {
@@ -928,6 +993,39 @@ mod tests {
         );
         // 無使用者檔 → 即為核心預設
         assert_eq!(prompt_terms_user_first(None), DEFAULT_PROMPT_TERMS.to_vec());
+    }
+
+    /// 術語還原診斷 trace 開關 `RAFLOW_RESTORE_TRACE` 純解析（**預設 OFF**，opt-in）：
+    /// 只有明確 truthy（1/true/yes/on，忽略大小寫、去前後空白）才 ON；未設/空/其餘 → OFF。
+    /// trace 含使用者口述全文，預設不得輸出（Codex review：避免敏感內容落 stderr/log）。
+    #[test]
+    fn parse_restore_trace_flag_defaults_off_and_opts_in() {
+        for v in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some(" yes "),
+            Some("on"),
+            Some("On"),
+        ] {
+            assert!(parse_restore_trace_flag(v), "應為 ON：{v:?}");
+        }
+        for v in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+            Some("2"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !parse_restore_trace_flag(v),
+                "應為 OFF（預設不輸出口述全文）：{v:?}"
+            );
+        }
     }
 
     /// 術語合併：預設 + 使用者檔（trim、跳過空行/註解）、保序去重。

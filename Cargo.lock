@@ -2216,6 +2216,7 @@ dependencies = [
  "arboard",
  "enigo",
  "raflow-core",
+ "tempfile",
 ]
 
 [[package]]

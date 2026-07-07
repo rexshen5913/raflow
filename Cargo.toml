@@ -38,6 +38,11 @@ whisper-rs = { version = "0.16", default-features = false, features = ["metal"] 
 # 滾動用的 transcribe_streaming 刻意不帶 initial_prompt（ADR-0006 §5 幻覺主因），故無繁體
 # 導向 → 以確定性後轉換補上，零幻覺風險。詳見 docs/spec/whisper.md §15。
 ferrous-opencc = "0.4"
+# 「原子寫回 replacements.txt」用：NamedTempFile 於目標同目錄建立**唯一命名**（O_EXCL）暫存檔，
+# 寫入後 persist（原子 rename）覆蓋目標，失敗時 drop 自動清除。避免固定 `.tmp` 名撞掉使用者既有
+# 檔（Codex review）、並免自行重造 race-free 暫存邏輯（憲法 §1.2 理由）。測試亦用其 tempdir 以真實
+# 檔案系統驗證（憲法 §2.3），免 env::set_var（§2.4）。已存在於 lockfile。
+tempfile = "3"
 raflow-core = { path = "crates/raflow-core" }
 
 [profile.dev]

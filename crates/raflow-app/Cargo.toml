@@ -49,6 +49,13 @@ objc2-app-kit = { workspace = true, features = [
     "NSFont",
     "NSFontDescriptor",
     "NSParagraphStyle",
+    # D1 更正擷取 popover（correction_popover.rs，ADR-0005）
+    "NSAlert",
+    "NSComboBox",
+    "NSButton",
+    "NSCell",
+    "NSMenu",
+    "NSMenuItem",
 ] }
 objc2-foundation = { workspace = true, features = [
     "NSThread",

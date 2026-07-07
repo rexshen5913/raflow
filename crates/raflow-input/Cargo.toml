@@ -9,6 +9,7 @@ description = "raflow 文字注入（macOS CGEvent via enigo）"
 
 [dependencies]
 raflow-core.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 enigo.workspace = true

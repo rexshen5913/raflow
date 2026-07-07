@@ -241,9 +241,10 @@ pub fn is_repetition_loop(text: &str) -> bool {
     false
 }
 
-/// Prompt priming 術語上限：prompt 過長會稀釋偏置效果、消耗 context、
-/// 並擴大回吐（prompt echo）面積。
-pub const ROLLING_PROMPT_TERM_CAP: usize = 20;
+/// Prompt priming 術語上限：prompt 過長會稀釋偏置效果、消耗 context（whisper.cpp 慣例 prompt
+/// 額度 ~`n_text_ctx/2` ≈ 224 token）、並擴大回吐（prompt echo）面積。英文術語每個約 2~4 token
+/// （含頓號分隔），30 個約 ~100~130 token，仍穩在額度內；50~60 個起才逼近上限。
+pub const ROLLING_PROMPT_TERM_CAP: usize = 30;
 /// 內建 dictation 命令字：讓 Whisper 把口述的「逗點/句點/換行」拼成標準形
 /// （而非 多點/去點/萬行 等發音近似變體），交給 normalize 收斂為標點。
 const ROLLING_PROMPT_COMMANDS: &[&str] = &["逗點", "句點", "換行"];
@@ -1150,7 +1151,7 @@ mod tests {
 
     /// Prompt priming（離線評估驗證）：術語 + 命令字餵給滾動路徑的
     /// initial_prompt，讓 Whisper 拼出標準形（ArgoCD 而非 R5CT、逗點/換行而非 多點/萬行）。
-    /// `build_rolling_prompt`：上限 20 個術語 + 內建命令字；`is_prompt_echo`：輸出含
+    /// `build_rolling_prompt`：上限 30 個術語 + 內建命令字；`is_prompt_echo`：輸出含
     /// prompt 的「相鄰詞對, 格式」（如 "ArgoCD, GitLab CI"）→ 判定回吐（防範 ADR-0006 已知幻覺模式）。
     #[test]
     fn rolling_prompt_builds_capped_and_detects_echo() {
@@ -1159,12 +1160,12 @@ mod tests {
         for kw in ["ArgoCD", "Terraform", "逗點", "句點", "換行"] {
             assert!(few.contains(kw), "prompt 應含 {kw:?}：{few:?}");
         }
-        let many: Vec<String> = (0..30).map(|i| format!("Term{i}")).collect();
+        let many: Vec<String> = (0..35).map(|i| format!("Term{i}")).collect();
         let many_refs: Vec<&str> = many.iter().map(String::as_str).collect();
         let capped = build_rolling_prompt(&many_refs);
         assert!(
-            capped.contains("Term19") && !capped.contains("Term20"),
-            "應截斷至 20 個術語：{capped:?}"
+            capped.contains("Term29") && !capped.contains("Term30"),
+            "應截斷至 30 個術語：{capped:?}"
         );
 
         // echo：scaffold（詞彙：）或相鄰詞對「A、B」格式 → 回吐；正常敘述 → 非回吐。

@@ -24,6 +24,9 @@ fn main() {
 mod accessibility;
 
 #[cfg(target_os = "macos")]
+mod correction_popover;
+
+#[cfg(target_os = "macos")]
 mod floating_overlay;
 
 #[cfg(target_os = "macos")]
@@ -34,7 +37,9 @@ mod settings;
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use crate::accessibility::{FocusDetection, detect_focus, ensure_trusted_with_prompt};
+    use crate::accessibility::{
+        FocusDetection, detect_focus, ensure_trusted_with_prompt, frontmost_app_pid,
+    };
     use crate::floating_overlay::FloatingOverlay;
     use crate::settings::{self, Settings};
     use arc_swap::ArcSwap;
@@ -44,8 +49,9 @@ mod mac {
     use raflow_audio::CaptureHandle;
     use raflow_core::{AudioFrame, HotkeyEvent, RaflowError, TranscriptUpdate};
     use raflow_input::{
-        ArboardClipboard, ClipboardBackend, EnigoBackend, InputBackend, PhraseEvent, PhrasePrinter,
-        Replacements, StreamDiff, apply_replacements, parse_replacements,
+        ArboardClipboard, ClipboardBackend, EnigoBackend, FocusGuard, InputBackend, PhraseEvent,
+        PhrasePrinter, RecentTokens, Replacements, StreamDiff, apply_replacements,
+        parse_replacements, upsert_contextual_priority_term_file, upsert_replacement_file,
     };
     use raflow_speech::{AppleSpeechBackend, WhisperContext, resolve_model_path};
     use std::sync::Arc;
@@ -64,6 +70,10 @@ mod mac {
     const MENU_ID_WHISPER_CORRECTION: &str = "settings.whisper_correction";
     const MENU_ID_EDIT_TERMS: &str = "edit.terms";
     const MENU_ID_EDIT_REPLACEMENTS: &str = "edit.replacements";
+    /// D1「教一個更正」擷取 popover 觸發（docs/design/vocabulary-growth.md §3）。
+    const MENU_ID_TEACH_CORRECTION: &str = "edit.teach_correction";
+    /// 「最近注入英文 token」候選緩衝保留的句數（供更正 popover 的「聽成」下拉）。
+    const RECENT_TOKENS_CAP: usize = 5;
     /// Whisper 餵的語言：強制 `zh` 中文 tokenizer，避免使用者反映的「偶爾出現韓文」
     /// （`auto` 模式下 Whisper 會自己 detect，相近 prosody 可能誤判 ko/ja）。
     /// 中英混合靠 `set_initial_prompt` 引導 + 結果 safety filter 雙保險。
@@ -87,6 +97,9 @@ mod mac {
         /// Phase 6b：排程 floating overlay 在指定延遲後 hide（讓使用者讀完 final）。
         /// 期間若有新的 OverlayText(Some) 抵達，自動取消 pending hide。
         OverlayScheduleHide(Duration),
+        /// D1：printer 發布「本 session 最近注入英文 token」候選快照給主執行緒（供更正 popover
+        /// 的「聽成」下拉）。經 channel 傳遞（憲法 §4.1），主執行緒只持唯讀副本、不跨緒共享記憶體。
+        RecentTokensUpdated(Vec<String>),
     }
 
     /// 把 `RaflowError` 映射到對應的 System Settings 深連結引導文字。
@@ -114,7 +127,9 @@ mod mac {
             | RaflowError::ConfigLoad { .. }
             | RaflowError::WhisperModelMissing { .. }
             | RaflowError::WhisperLoad { .. }
-            | RaflowError::WhisperInference { .. } => None,
+            | RaflowError::WhisperInference { .. }
+            | RaflowError::InvalidReplacement { .. }
+            | RaflowError::ConfigWrite { .. } => None,
         }
     }
 
@@ -188,6 +203,25 @@ mod mac {
 
     /// 執行 printer reducer 算出的注入動作（先 backspace 再 append）。
     /// `input` 為 `None`（EnigoBackend init 失敗）時純 no-op；錯誤只記錄不中斷 session。
+    /// 經 [`FocusGuard`] 檢查後才注入（security audit run-1 Finding 1 修復）：前景 app
+    /// 與 session 起點不同 → 跳過注入並閂住整個 session（防止 backspace 對不上毀損文字），
+    /// 閂鎖觸發那一次印 stderr 提示。剪貼簿與 overlay 不經此函式，不受影響。
+    fn exec_inject_guarded(
+        guard: &mut FocusGuard,
+        input: &mut Option<EnigoBackend>,
+        diff: &StreamDiff,
+    ) {
+        let was_latched = guard.latched();
+        if guard.should_inject(frontmost_app_pid()) {
+            exec_inject(input, diff);
+        } else if !was_latched {
+            eprintln!(
+                "! focus 已切到其他 app —— 本輪錄音的文字注入停止（避免打進錯的視窗）；\n  \
+                 停止錄音後全文仍會複製到剪貼簿，可 Cmd+V 取回"
+            );
+        }
+    }
+
     fn exec_inject(input: &mut Option<EnigoBackend>, diff: &StreamDiff) {
         let Some(backend) = input.as_mut() else {
             return;
@@ -242,6 +276,12 @@ mod mac {
         // → 改檔後下次錄音即生效。套用在餵給 printer 之前，故 partial / final / overlay / 剪貼簿
         // 都是修正後文字。詳見 docs/spec/input.md。
         let mut replacements = load_replacements();
+        // 注入焦點守衛（Finding 1）：SessionStarted 記下前景 app PID 基準，之後每次注入
+        // 前比對；使用者中途 Cmd+Tab 切走 → 本 session 注入停止（閂鎖），不打進錯的 app。
+        let mut focus_guard = FocusGuard::new();
+        // D1：本 session「最近注入英文 token」候選緩衝（記憶體、有上限、session 結束即棄）。
+        // 每句定稿後 push，並把候選快照經 proxy 發布給主執行緒（更正 popover 的「聽成」下拉）。
+        let mut recent_tokens = RecentTokens::new(RECENT_TOKENS_CAP);
         rt.block_on(async move {
             while let Some(update) = transcript_rx.recv().await {
                 match update {
@@ -249,14 +289,18 @@ mod mac {
                         // 新一輪錄音開始：清空鎖定前綴與草稿，避免上次殘留算出錯誤 backspace
                         // （spec/input.md §3）。reducer 回 no-op，不對已輸入內容 backspace。
                         replacements = load_replacements(); // 重讀 → 改檔即生效
+                        focus_guard.session_started(frontmost_app_pid());
                         let _ = printer.apply(PhraseEvent::SessionStarted);
                         let _ = proxy.send_event(UserEvent::OverlayText(None));
+                        // 新錄音 session：候選緩衝清空（§9 隱私：不跨 session 殘留），並通知主執行緒清空。
+                        recent_tokens = RecentTokens::new(RECENT_TOKENS_CAP);
+                        let _ = proxy.send_event(UserEvent::RecentTokensUpdated(Vec::new()));
                     }
                     TranscriptUpdate::Partial(text) => {
                         let text = apply_replacements(&text, &replacements);
                         println!("~ {text}");
                         let diff = printer.apply(PhraseEvent::Partial(&text));
-                        exec_inject(&mut input, &diff);
+                        exec_inject_guarded(&mut focus_guard, &mut input, &diff);
                         // Floating panel 顯示「已鎖定前綴 + 當前草稿」；面板自己 wrap，不截斷。
                         let shown = format!("{}{}", printer.committed(), printer.last_partial());
                         let _ = proxy.send_event(UserEvent::OverlayText(Some(shown)));
@@ -267,15 +311,19 @@ mod mac {
                         let text = apply_replacements(&text, &replacements);
                         println!("= {text}");
                         let diff = printer.apply(PhraseEvent::PhraseFinal(&text));
-                        exec_inject(&mut input, &diff);
+                        exec_inject_guarded(&mut focus_guard, &mut input, &diff);
                         let shown = printer.committed().to_string();
                         let _ = proxy.send_event(UserEvent::OverlayText(Some(shown)));
+                        // D1：句級定稿即注入完成 → 收進候選緩衝並發布快照。
+                        recent_tokens.push_sentence(&text);
+                        let _ = proxy
+                            .send_event(UserEvent::RecentTokensUpdated(recent_tokens.candidates()));
                     }
                     TranscriptUpdate::Final(text) => {
                         let text = apply_replacements(&text, &replacements);
                         println!("= {text}");
                         let diff = printer.apply(PhraseEvent::Final(&text));
-                        exec_inject(&mut input, &diff);
+                        exec_inject_guarded(&mut focus_guard, &mut input, &diff);
                         // 整段 = committed（含所有已鎖定句 + 本次收尾句）。
                         let whole = printer.committed().to_string();
                         if let Some(cb) = clipboard.as_mut() {
@@ -287,6 +335,10 @@ mod mac {
                         let _ = proxy.send_event(UserEvent::OverlayText(Some(whole)));
                         let _ =
                             proxy.send_event(UserEvent::OverlayScheduleHide(OVERLAY_HIDE_DELAY));
+                        // D1：收尾句也收進候選緩衝並發布快照。
+                        recent_tokens.push_sentence(&text);
+                        let _ = proxy
+                            .send_event(UserEvent::RecentTokensUpdated(recent_tokens.candidates()));
                     }
                     TranscriptUpdate::Error(msg) => {
                         eprintln!("! speech error: {msg}");
@@ -513,6 +565,8 @@ mod mac {
             initial.whisper_correction,
             None,
         );
+        let teach_correction =
+            MenuItem::with_id(MENU_ID_TEACH_CORRECTION, "教 raflow 一個更正…", true, None);
         let edit_terms = MenuItem::with_id(MENU_ID_EDIT_TERMS, "編輯自訂詞彙…", true, None);
         let edit_replacements =
             MenuItem::with_id(MENU_ID_EDIT_REPLACEMENTS, "編輯取代規則…", true, None);
@@ -525,6 +579,7 @@ mod mac {
         menu.append(&whisper_correction).map_err(menu_err)?;
         menu.append(&PredefinedMenuItem::separator())
             .map_err(menu_err)?;
+        menu.append(&teach_correction).map_err(menu_err)?;
         menu.append(&edit_terms).map_err(menu_err)?;
         menu.append(&edit_replacements).map_err(menu_err)?;
         menu.append(&PredefinedMenuItem::separator())
@@ -573,7 +628,7 @@ mod mac {
 # 內建已涵蓋約 120 個常用術語（Kubernetes / Docker / AWS / Terraform /
 # PostgreSQL / ChatGPT…），這裡只需要放「內建沒有的、你自己常用的」詞。
 #
-# 最上方的詞優先進入 Whisper 修正提示（上限 20）——把最常被聽錯的放最前面。
+# 最上方的詞優先進入 Whisper 修正提示（上限 30）——把最常被聽錯的放最前面。
 # 改完存檔後，下次「雙擊 Cmd 開始錄音」即生效，不必重啟 app。
 #
 # 範例（拿掉開頭的 # 即生效）：
@@ -617,6 +672,66 @@ mod mac {
         {
             eprintln!("! 開啟 {} 失敗: {e}", path.display());
         }
+    }
+
+    /// D1 menu「教 raflow 一個更正…」動作：開擷取 popover（`聽成` 下拉帶最近注入 token），使用者
+    /// 按「記住」後把 `聽成 => 正確` 寫進 `replacements.txt`（下次錄音生效）；若勾「也加優先區」則把
+    /// `正確` 提升到 `contextual_terms.txt` 優先區頂端。純核心（驗證／upsert／原子寫）在 raflow-input。
+    /// 全程失敗只記 log，menu 動作不可讓 app 崩潰。必須在主執行緒呼叫（popover 內以 MainThreadMarker 保證）。
+    /// menu「教一個更正」動作。**成功靜默**（對話框關掉＝成功，使用者選擇的 UX）；只有**出錯**
+    /// 才彈原生提示（`show_notice`）：空欄位、找不到路徑、寫入失敗。取消／非主執行緒 → 無事發生。
+    fn teach_correction(recent_tokens: &[String]) {
+        let Some(input) = crate::correction_popover::prompt_correction(recent_tokens) else {
+            return; // 取消或非主執行緒
+        };
+        let heard = input.heard.trim();
+        let correct = input.correct.trim();
+        if heard.is_empty() || correct.is_empty() {
+            crate::correction_popover::show_notice("未記住", "「聽成」和「正確」都要填。");
+            return;
+        }
+        let Some(rpath) = replacements_path() else {
+            crate::correction_popover::show_notice("記住失敗", "找不到設定檔路徑（HOME 未設？）。");
+            return;
+        };
+        if let Err(e) = upsert_replacement_file(&rpath, heard, correct) {
+            report_error("! 更正寫入失敗", &e);
+            crate::correction_popover::show_notice("記住失敗", &format!("寫入取代規則失敗：{e}"));
+            return;
+        }
+        // 優先區：讀失敗（非「不存在」）不當空檔——由 upsert_contextual_priority_term_file 保證，
+        // 避免覆蓋既有詞庫（Codex round-2）。失敗只提示但不算整體失敗（取代規則已存）。
+        if input.add_to_priority {
+            match contextual_terms_edit_path() {
+                Some(cpath) => {
+                    if let Err(e) = upsert_contextual_priority_term_file(&cpath, correct) {
+                        report_error("! 優先區寫入失敗（取代規則已存）", &e);
+                        crate::correction_popover::show_notice(
+                            "已記住（優先區未加入）",
+                            &format!("取代規則已存，但加入 Whisper 優先區失敗：{e}"),
+                        );
+                        return;
+                    }
+                }
+                None => {
+                    eprintln!("! 無法解析 contextual_terms.txt 路徑，未加入優先區（取代規則已存）");
+                    crate::correction_popover::show_notice(
+                        "已記住（優先區未加入）",
+                        "取代規則已存，但找不到 contextual_terms.txt 路徑。",
+                    );
+                    return;
+                }
+            }
+        }
+        // 成功：不彈提示，對話框已關＝完成。log 供終端排查。
+        eprintln!(
+            "raflow: 已記住更正「{heard} => {correct}」{}（下次錄音生效）",
+            if input.add_to_priority {
+                "＋優先區"
+            } else {
+                ""
+            }
+        );
     }
 
     /// 設定 NSApplication 為 Accessory 模式：不占 Dock，但可在 menu bar 放 tray icon。
@@ -731,6 +846,9 @@ mod mac {
         // partial 都打 AX API；spec/overlay.md §8.3-fix）。預設 false 代表「不確定」→
         // 顯示 floating panel 作為視覺安全網。
         let mut session_focused_in_text_input: bool = false;
+        // D1：主執行緒持有的「最近注入英文 token」候選唯讀副本（printer 經 proxy 發布，見
+        // UserEvent::RecentTokensUpdated）。只在主執行緒讀寫，不跨緒共享。供更正 popover 的下拉。
+        let mut recent_tokens: Vec<String> = Vec::new();
 
         event_loop.run(move |event, _target, control_flow| {
             // 預設 wait；若有 pending hide 則 wait 到指定時間醒來收尾
@@ -831,6 +949,9 @@ mod mac {
                     UserEvent::OverlayScheduleHide(d) => {
                         overlay_hide_at = Some(Instant::now() + d);
                     }
+                    UserEvent::RecentTokensUpdated(v) => {
+                        recent_tokens = v;
+                    }
                     UserEvent::MenuClick(id) => {
                         if id == QUIT_MENU_ID {
                             *control_flow = ControlFlow::Exit;
@@ -869,6 +990,9 @@ mod mac {
                             );
                         } else if id == MENU_ID_EDIT_REPLACEMENTS {
                             open_user_config(replacements_path(), REPLACEMENTS_TEMPLATE);
+                        } else if id == MENU_ID_TEACH_CORRECTION {
+                            // 成功靜默（對話框關掉＝完成）；出錯由 teach_correction 內部彈原生提示。
+                            teach_correction(&recent_tokens);
                         }
                     }
                 },
@@ -933,6 +1057,13 @@ mod mac {
                 },
                 RaflowError::ClipboardWrite {
                     detail: "NSPasteboard error".into(),
+                },
+                RaflowError::InvalidReplacement {
+                    detail: "heard 不可含換行".into(),
+                },
+                RaflowError::ConfigWrite {
+                    path: "/x/replacements.txt".into(),
+                    source: std::io::Error::other("disk full"),
                 },
             ];
             for err in cases {

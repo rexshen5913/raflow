@@ -1,5 +1,6 @@
 mod backend;
 mod session;
+mod term_restore;
 mod whisper_backend;
 
 #[cfg(target_os = "macos")]
@@ -7,6 +8,7 @@ mod apple_backend;
 
 pub use backend::SpeechBackend;
 pub use session::Session;
+pub use term_restore::restore_terms;
 pub use whisper_backend::{
     ROLLING_PENDING_SPEECH_FAST_LOCK, ROLLING_TRAILING_SILENCE_FAST,
     ROLLING_TRAILING_SILENCE_SAMPLES, RollingTickOutcome, SAMPLES_PER_CENTISECOND, WhisperContext,

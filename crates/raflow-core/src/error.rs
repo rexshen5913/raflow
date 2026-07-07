@@ -9,6 +9,12 @@ pub enum RaflowError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to write config to {path}")]
+    ConfigWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to register hotkey: {detail}")]
     HotkeyRegister { detail: String },
     #[error("audio capture failed: {detail}")]
@@ -29,6 +35,8 @@ pub enum RaflowError {
     WhisperLoad { detail: String },
     #[error("whisper inference failed: {detail}")]
     WhisperInference { detail: String },
+    #[error("invalid replacement rule: {detail}")]
+    InvalidReplacement { detail: String },
 }
 
 #[cfg(test)]

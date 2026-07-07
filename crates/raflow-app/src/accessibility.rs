@@ -7,6 +7,9 @@
 //!   limitation，無法靠 macOS public API 阻止），但 floating panel 顯示完整文字作為
 //!   視覺安全網讓使用者看到自己說了什麼
 //!
+//! 另提供 [`frontmost_app_pid`]：app 級 PID 查詢，供注入焦點守衛（spec/input.md §7d）
+//! 在「錄音中切 app」時停止注入——與上述元件級偵測互補，不判斷元件是否可輸入。
+//!
 //! ## 偵測邏輯（三狀態）
 //!
 //! 1. **`Untrusted`**：raflow 沒拿到 macOS Accessibility 權限——AX API 全部 disabled。
@@ -116,6 +119,28 @@ pub fn ensure_trusted_with_prompt() -> bool {
     unsafe { AXIsProcessTrustedWithOptions(Some(dict.as_opaque())) }
 }
 
+/// 目前前景（focused）app 的 PID。供注入焦點守衛（`raflow_input::FocusGuard`，
+/// security audit run-1 Finding 1）使用：printer 在 `SessionStarted` 記基準、每次注入前
+/// 比對，PID 變了就停止本 session 的注入，避免文字與 backspace 打進中途切過去的 app。
+///
+/// 查不到（AX 未授權 / 無 focused app / query 失敗）→ `None`，守衛端 fail-open。
+/// AX client C API 文件保證任意執行緒可呼叫，printer thread 直接用。
+pub fn frontmost_app_pid() -> Option<i32> {
+    if !is_trusted() {
+        return None;
+    }
+    // SAFETY: AXUIElement::new_system_wide 是 wrapper over AXUIElementCreateSystemWide，
+    // 該 C API 無前置條件、任意執行緒可呼叫，回傳新 retained CFTypeRef。
+    let sys = unsafe { AXUIElement::new_system_wide() };
+    let app = copy_ax_element(&sys, "AXFocusedApplication")?;
+    let mut pid: i32 = 0;
+    // SAFETY: app 為上方取得的有效 CFRetained 引用；pid 為本 stack frame 的 i32
+    // （與 Apple `pid_t` ABI 等價），`NonNull::from(&mut pid)` 保證非 null；
+    // 任何錯誤回傳值經下方條件過濾，不會使用未寫入的 pid。
+    let err = unsafe { app.pid(NonNull::from(&mut pid)) };
+    (err == AXError::Success && pid > 0).then_some(pid)
+}
+
 /// 偵測目前 focused element 的狀態。三狀態語意請見 module 文件。
 pub fn detect_focus() -> FocusDetection {
     if !is_trusted() {
@@ -212,6 +237,15 @@ mod tests {
     #[test]
     fn ensure_trusted_with_prompt_smoke() {
         let _ = ensure_trusted_with_prompt();
+    }
+
+    /// `frontmost_app_pid()` 的 FFI path 要能跑不 panic。回傳值依 TCC 狀態與當下
+    /// focused app 而異（CI headless 多為 None），只驗證「有值時必為正 PID」的合約。
+    #[test]
+    fn frontmost_app_pid_smoke() {
+        if let Some(pid) = frontmost_app_pid() {
+            assert!(pid > 0, "AX 回報的 PID 必為正值，got {pid}");
+        }
     }
 
     /// EDITABLE_ROLES 必須涵蓋常見編輯欄位，且不誤把按鈕／連結／靜態文字當成輸入框。
