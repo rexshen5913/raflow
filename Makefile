@@ -69,6 +69,16 @@ icons:
 dev-cert:
 	@bash packaging/create-dev-cert.sh "$(DEV_CERT_NAME)"
 
+# 重新彙整第三方授權聲明（THIRD-PARTY-LICENSES.md）。發佈 binary 靜態連結/內嵌了
+# whisper.cpp、OpenCC、objc2、enigo 等 MIT/Apache 專案，須保留其版權/授權文字。
+# 需 cargo-about：cargo install cargo-about --features cli。about.toml/about.hbs 為設定。
+# 產出會被 bundle / bundle-whisper 複製進 .app/Contents/Resources。
+# 注意：cargo-about 只涵蓋 crate；whisper.cpp 與 OpenCC 字典的手動段落在檔尾，
+# 重新產生後需手動補回（見 about.hbs 說明）。
+licenses:
+	cargo about generate about.hbs --all-features -o THIRD-PARTY-LICENSES.md
+	@echo "→ 記得補回檔尾『Embedded native components』手動段落（whisper.cpp / OpenCC）"
+
 # 打包 .app bundle；Resources/ 放 app icon
 # 用同一顆 self-signed dev cert 簽章，避免每次 rebuild 重置 TCC 權限授權。
 # 真正穩定的代碼簽章（Developer ID + notarization）屬後續 Phase。
@@ -81,6 +91,7 @@ bundle: icons dev-cert
 	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" "$(BUNDLE_PLIST)"
 	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" "$(BUNDLE_PLIST)"
 	cp "$(APP_ICON)" "$(BUNDLE_RES)/icon.icns"
+	cp THIRD-PARTY-LICENSES.md "$(BUNDLE_RES)/THIRD-PARTY-LICENSES.md"
 	codesign --force --deep --sign "$(DEV_CERT_NAME)" "$(BUNDLE_DIR)"
 	@echo ""
 	@echo "Bundle ready: $(BUNDLE_DIR)"
@@ -113,6 +124,7 @@ bundle-whisper: icons dev-cert
 	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" "$(BUNDLE_PLIST)"
 	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" "$(BUNDLE_PLIST)"
 	cp "$(APP_ICON)" "$(BUNDLE_RES)/icon.icns"
+	cp THIRD-PARTY-LICENSES.md "$(BUNDLE_RES)/THIRD-PARTY-LICENSES.md"
 	codesign --force --deep --sign "$(DEV_CERT_NAME)" "$(BUNDLE_DIR)"
 	@echo ""
 	@echo "Bundle ready (with Whisper): $(BUNDLE_DIR)"

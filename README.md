@@ -110,4 +110,19 @@ make install-app-whisper  # 建置 .app 並安裝到 /Applications
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © 2026 Rex Shen
+
+### Acknowledgements
+
+raflow 站在許多開源專案之上。發佈的 `.app` 靜態連結／內嵌了下列元件，完整的版權與
+授權文字見 [`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md)（`.app/Contents/Resources/`
+內也隨附一份）：
+
+- **[whisper.cpp](https://github.com/ggerganov/whisper.cpp)**（MIT，© The ggml authors）— 本機語音校正引擎
+- **[OpenCC](https://github.com/BYVoid/OpenCC)** 轉換字典（Apache-2.0，透過 `ferrous-opencc` 內嵌）— 簡→繁轉換
+- **[objc2](https://github.com/madsmtm/objc2)** 生態系（MIT / Apache-2.0）— 純 Rust Apple Framework 綁定
+- **[enigo](https://github.com/enigo-rs/enigo)**（MIT）— 文字注入
+- 其餘 Rust crate 依賴（`thiserror`、`anyhow`、`arc-swap`、`dashmap`、`cpal` 等）
+
+安裝時下載的模型：**OpenAI Whisper**（MIT）、其 GGML 轉換（© Georgi Gerganov，MIT）、
+**Silero VAD**（MIT）。

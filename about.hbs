@@ -1,0 +1,29 @@
+# Third-Party Licenses
+
+raflow is distributed as a compiled application that statically links and embeds
+the open-source components listed below. Their copyright notices and license
+texts are reproduced here in compliance with their terms.
+
+This file is auto-generated from the crate dependency graph by `cargo about`
+(`make licenses`). Two additional components are **not** Rust crates and are
+documented manually at the end: the vendored **whisper.cpp** C/C++ sources and
+the **OpenCC** conversion dictionaries. The speech models downloaded at install
+time are credited in the project README.
+
+---
+
+{{#each licenses}}
+## {{name}} ({{id}})
+
+Applies to:
+{{#each used_by}}
+- **{{crate.name}}** {{crate.version}}
+{{/each}}
+
+```
+{{{text}}}
+```
+
+---
+
+{{/each}}

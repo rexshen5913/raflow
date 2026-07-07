@@ -1,0 +1,25 @@
+# cargo-about 設定：彙整所有依賴的授權，滿足 MIT/Apache 等 permissive 授權的
+# attribution 條款（raflow 發佈編譯後 binary，須保留上游版權/授權文字）。
+# 產生：make licenses（見 Makefile）。
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "Unlicense",
+    "MPL-2.0",
+    "0BSD",
+    "CC0-1.0",
+]
+
+# 只發佈 Apple Silicon；以此 target 評估實際會連結的依賴集。
+targets = ["aarch64-apple-darwin"]
+
+# build/dev-only 依賴不進發佈物，不需 attribution。
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
