@@ -73,11 +73,16 @@ dev-cert:
 # whisper.cpp、OpenCC、objc2、enigo 等 MIT/Apache 專案，須保留其版權/授權文字。
 # 需 cargo-about：cargo install cargo-about --features cli。about.toml/about.hbs 為設定。
 # 產出會被 bundle / bundle-whisper 複製進 .app/Contents/Resources。
-# 注意：cargo-about 只涵蓋 crate；whisper.cpp 與 OpenCC 字典的手動段落在檔尾，
-# 重新產生後需手動補回（見 about.hbs 說明）。
+#
+# 兩段組成、**確定性**產生（不依賴人工記憶）：
+#   (1) cargo-about 產出 crate 授權 → THIRD-PARTY-LICENSES.md（覆寫）
+#   (2) 附加 about-native.md：whisper.cpp / OpenCC 字典等**非 crate 內嵌來源**的手動段落
+#       （about-native.md 為此段的唯一真實來源，已納入版控；cargo-about 不會動它）。
+# 少了 (2) 會漏掉內嵌 native 元件的必要 attribution，故 concat 寫進同一 target。
 licenses:
 	cargo about generate about.hbs --all-features -o THIRD-PARTY-LICENSES.md
-	@echo "→ 記得補回檔尾『Embedded native components』手動段落（whisper.cpp / OpenCC）"
+	printf '\n' >> THIRD-PARTY-LICENSES.md
+	cat about-native.md >> THIRD-PARTY-LICENSES.md
 
 # 打包 .app bundle；Resources/ 放 app icon
 # 用同一顆 self-signed dev cert 簽章，避免每次 rebuild 重置 TCC 權限授權。
