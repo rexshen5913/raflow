@@ -19,6 +19,9 @@ use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSEventType};
 use raflow_core::{HotkeyEvent, RaflowError};
 use tokio::sync::mpsc::UnboundedSender;
 
+use objc2_core_graphics::{CGEvent, CGEventField};
+
+use crate::activity::key_is_user_takeover;
 use crate::double_tap::DoubleTapDetector;
 
 /// 雙擊兩次 Cmd 按下之間的最大時間差。
@@ -106,6 +109,75 @@ pub fn register(tx: UnboundedSender<HotkeyEvent>) -> Result<HotkeyHandle, Raflow
     })?;
 
     Ok(HotkeyHandle {
+        monitor: Some(monitor),
+    })
+}
+
+/// Edit Guard v1 使用者接管活動監看器的擁有者；drop 時 `removeMonitor` 解除。
+///
+/// 由 `raflow-app` 在**每次錄音開始**時建立、**停止**時 drop（設計 §5：監看隨錄音起停；
+/// §7 隱私：只在錄音期間啟用）。與 `HotkeyHandle` 為各自獨立的 NSEvent 監聽，互不干擾。
+pub struct ActivityMonitorHandle {
+    monitor: Option<Retained<AnyObject>>,
+}
+
+impl Drop for ActivityMonitorHandle {
+    fn drop(&mut self) {
+        if let Some(token) = self.monitor.take() {
+            // SAFETY: removeMonitor 接受先前由 addGlobalMonitorForEventsMatchingMask_handler
+            // 回傳的同一個 token；我們持有唯一 strong ref，drop 時消耗註冊。
+            unsafe {
+                NSEvent::removeMonitor(&token);
+            }
+        }
+    }
+}
+
+/// 註冊「使用者接管」全域監看：滑鼠按下（左/右）或導覽鍵按下 → `tx.send(())`。
+///
+/// 只認 raflow **從不注入**的事件（滑鼠、方向鍵/Home/End/PageUp/Down），故零誤判、
+/// 免自我濾除（設計 §3）。一般可列印字元 / Backspace（raflow 會注入）一律忽略。
+/// 必須於主執行緒呼叫（NSEvent global monitor 契約）。
+pub fn register_activity_monitor(
+    tx: UnboundedSender<()>,
+) -> Result<ActivityMonitorHandle, RaflowError> {
+    let _mtm = MainThreadMarker::new().ok_or_else(|| RaflowError::HotkeyRegister {
+        detail: "register_activity_monitor() must be called from the main thread".into(),
+    })?;
+
+    let mask = NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::KeyDown;
+
+    let handler: RcBlock<dyn Fn(NonNull<NSEvent>)> =
+        RcBlock::new(move |event_ptr: NonNull<NSEvent>| {
+            // SAFETY: Apple 對 addGlobalMonitorForEvents 的 handler block 契約保證
+            // event 參數在 callback 期間為有效非空 NSEvent。
+            let event: &NSEvent = unsafe { event_ptr.as_ref() };
+            let is_takeover = match event.r#type() {
+                // raflow 從不注入滑鼠事件 → 滑鼠按下必為使用者。
+                NSEventType::LeftMouseDown | NSEventType::RightMouseDown => true,
+                // 讀 kCGEventSourceUserData 自我濾除：raflow 自身注入的按鍵帶
+                // RAFLOW_INJECT_MARKER，其餘（真人按鍵，任何鍵）皆算接管；讀不到則退回
+                // 導覽鍵安全子集（見 activity::key_is_user_takeover）。
+                NSEventType::KeyDown => {
+                    let user_data = event.CGEvent().map(|cg| {
+                        CGEvent::integer_value_field(Some(&cg), CGEventField::EventSourceUserData)
+                    });
+                    key_is_user_takeover(user_data, event.keyCode())
+                }
+                _ => false,
+            };
+            if is_takeover {
+                // 接收端（printer thread）drop 後 send 失敗屬正常，忽略。
+                let _ = tx.send(());
+            }
+        });
+
+    let token = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &handler);
+    let monitor = token.ok_or_else(|| RaflowError::HotkeyRegister {
+        detail: "activity monitor addGlobalMonitorForEvents returned nil (Input Monitoring 權限可能未授予)".into(),
+    })?;
+
+    Ok(ActivityMonitorHandle {
         monitor: Some(monitor),
     })
 }

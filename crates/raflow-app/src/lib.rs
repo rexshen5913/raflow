@@ -94,7 +94,12 @@ impl<B: SpeechBackend> App<B> {
                 // 導致下一次 session 第一個 partial 算出錯誤的 backspace。
                 // 詳見 docs/spec/input.md §3。Send 失敗代表 receiver 已關，整條 pipeline
                 // 都壞了，這裡靜默忽略，由後續 transcript send 自然炸出。
-                let _ = self.transcript_tx.send(TranscriptUpdate::SessionStarted);
+                // 附帶本 session 的 rolling 狀態：Edit Guard 只在有中途段界的滾動 session 啟用
+                // （spec/input.md §7f）。is_rolling() 於 start 後有效。
+                let rolling = self.session.is_rolling();
+                let _ = self
+                    .transcript_tx
+                    .send(TranscriptUpdate::SessionStarted { rolling });
                 Ok(Transition::StartRecording)
             }
             (AppState::Recording, HotkeyEvent::Pressed) => {
@@ -144,6 +149,8 @@ mod tests {
         unavailable: Vec<String>,
         /// 每次 start 嘗試的 locale（含失敗），用來驗證 fallback 是否真的先試 preferred。
         attempts: Vec<String>,
+        /// `session_rolling()` 的回傳（模擬滾動 / 非滾動 session）。
+        rolling: bool,
     }
 
     #[derive(Clone, Default)]
@@ -166,6 +173,13 @@ mod tests {
         fn with_unavailable(locales: &[&str]) -> Self {
             let fb = Self::new();
             fb.inner.borrow_mut().unavailable = locales.iter().map(|l| l.to_string()).collect();
+            fb
+        }
+
+        /// 模擬滾動 session（`session_rolling()` 回 true）。
+        fn rolling() -> Self {
+            let fb = Self::new();
+            fb.inner.borrow_mut().rolling = true;
             fb
         }
 
@@ -217,6 +231,10 @@ mod tests {
                 .events
                 .push(FakeEvent::RollingTick(is_final));
             Ok(())
+        }
+
+        fn session_rolling(&self) -> bool {
+            self.inner.borrow().rolling
         }
     }
 
@@ -343,7 +361,7 @@ mod tests {
         app.on_hotkey(HotkeyEvent::Pressed).unwrap();
         assert_eq!(
             rx.try_recv().ok(),
-            Some(TranscriptUpdate::SessionStarted),
+            Some(TranscriptUpdate::SessionStarted { rolling: false }),
             "Idle → Recording must emit SessionStarted exactly once",
         );
         assert!(rx.try_recv().is_err(), "no extra emission");
@@ -363,8 +381,22 @@ mod tests {
         app.on_hotkey(HotkeyEvent::Pressed).unwrap();
         assert_eq!(
             rx.try_recv().ok(),
-            Some(TranscriptUpdate::SessionStarted),
+            Some(TranscriptUpdate::SessionStarted { rolling: false }),
             "second Idle → Recording must emit SessionStarted again",
+        );
+    }
+
+    /// SessionStarted 必須帶上本 session 的 rolling 狀態（printer 據此決定是否啟用 Edit Guard；
+    /// spec/input.md §7f）。滾動 backend → `rolling: true`；非滾動（預設）→ `rolling: false`。
+    #[test]
+    fn session_started_carries_backend_rolling_flag() {
+        let (tx, mut rx) = unbounded_channel::<TranscriptUpdate>();
+        let mut app = App::new(FakeBackend::rolling(), "zh-TW".into(), tx);
+        app.on_hotkey(HotkeyEvent::Pressed).unwrap();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(TranscriptUpdate::SessionStarted { rolling: true }),
+            "rolling session must propagate rolling: true",
         );
     }
 
@@ -386,7 +418,7 @@ mod tests {
 
         // retry 成功後才該送
         app.on_hotkey(HotkeyEvent::Pressed).unwrap();
-        assert_eq!(rx.try_recv().ok(), Some(TranscriptUpdate::SessionStarted));
+        assert_eq!(rx.try_recv().ok(), Some(TranscriptUpdate::SessionStarted { rolling: false }));
     }
 
     /// 停止錄音時，必須先送一次 `rolling_tick(true)` 收尾 flush，**再** `stop`（ADR-0006 §8.7.2）。

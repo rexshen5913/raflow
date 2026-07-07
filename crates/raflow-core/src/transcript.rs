@@ -3,7 +3,11 @@ pub enum TranscriptUpdate {
     /// Worker 進入 Recording 狀態的訊號，給 printer 用來重置 streaming inject 狀態
     /// （`last_partial`），避免上一次 session 沒收到 Final 時殘留導致下一次 session
     /// 第一個 partial 算出錯誤的 backspace。詳見 docs/spec/input.md §3。
-    SessionStarted,
+    ///
+    /// `rolling`：本 session 是否為句級滾動（會產生中途 `PhraseFinal` 段界）。Edit Guard
+    /// 只在 rolling session 啟用——非滾動 session 沒有中途段界可作恢復錨點，若凍結會卡到
+    /// 錄音結束（且非滾動沒有「改中途定稿詞」情境）。詳見 docs/spec/input.md §7f。
+    SessionStarted { rolling: bool },
     Partial(String),
     /// 句級滾動校正：這句 Whisper 定稿 → printer 對齊後鎖定，之後不再更動。
     /// `Partial` 只代表**當前未定稿句**；`PhraseFinal` 代表**該句定稿並鎖定**。
@@ -38,10 +42,13 @@ mod tests {
     }
 
     #[test]
-    fn session_started_is_distinct_unit_variant() {
-        let a = TranscriptUpdate::SessionStarted;
-        let b = TranscriptUpdate::SessionStarted;
-        assert_eq!(a, b);
+    fn session_started_carries_rolling_flag() {
+        let a = TranscriptUpdate::SessionStarted { rolling: true };
+        assert_eq!(a.clone(), a);
+        assert_ne!(
+            TranscriptUpdate::SessionStarted { rolling: true },
+            TranscriptUpdate::SessionStarted { rolling: false },
+        );
         assert_ne!(a, TranscriptUpdate::Partial(String::new()));
         assert_ne!(a, TranscriptUpdate::Final(String::new()));
     }

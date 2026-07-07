@@ -59,6 +59,11 @@ impl<B: SpeechBackend> Session<B> {
         }
         self.backend.rolling_tick(is_final)
     }
+
+    /// 本 session 是否為句級滾動（`start` 後有效）。委派 backend；供 Edit Guard 判定啟用。
+    pub fn is_rolling(&self) -> bool {
+        self.backend.session_rolling()
+    }
 }
 
 #[cfg(test)]

@@ -257,7 +257,7 @@ fn replay(
             );
         }
         let started = Instant::now();
-        let out = rolling_tick_core(ctx, vad_path, &pcm[..fed], finalized, false, prompt_terms)?;
+        let out = rolling_tick_core(ctx, vad_path, &pcm[..fed], finalized, false, prompt_terms, false)?;
         let ms = started.elapsed().as_secs_f32() * 1_000.0;
         max_tick_ms = max_tick_ms.max(ms);
         if out.finalized_samples < finalized {
@@ -272,7 +272,7 @@ fn replay(
     }
     // 停止收尾（使用者最有感的延遲）。
     let started = Instant::now();
-    let out = rolling_tick_core(ctx, vad_path, pcm, finalized, true, prompt_terms)?;
+    let out = rolling_tick_core(ctx, vad_path, pcm, finalized, true, prompt_terms, false)?;
     let final_ms = started.elapsed().as_secs_f32() * 1_000.0;
     if out.finalized_samples < finalized {
         cursor_ok = false;

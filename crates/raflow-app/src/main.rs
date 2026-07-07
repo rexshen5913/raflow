@@ -49,9 +49,10 @@ mod mac {
     use raflow_audio::CaptureHandle;
     use raflow_core::{AudioFrame, HotkeyEvent, RaflowError, TranscriptUpdate};
     use raflow_input::{
-        ArboardClipboard, ClipboardBackend, EnigoBackend, FocusGuard, InputBackend, PhraseEvent,
-        PhrasePrinter, RecentTokens, Replacements, StreamDiff, apply_replacements,
-        parse_replacements, upsert_contextual_priority_term_file, upsert_replacement_file,
+        ArboardClipboard, ClipboardBackend, EditGuard, EnigoBackend, FocusGuard, InputBackend,
+        PartialAction, PhraseEvent, PhrasePrinter, RecentTokens, Replacements, StreamDiff,
+        apply_replacements, parse_replacements, upsert_contextual_priority_term_file,
+        upsert_replacement_file,
     };
     use raflow_speech::{AppleSpeechBackend, WhisperContext, resolve_model_path};
     use std::sync::Arc;
@@ -100,6 +101,9 @@ mod mac {
         /// D1：printer 發布「本 session 最近注入英文 token」候選快照給主執行緒（供更正 popover
         /// 的「聽成」下拉）。經 channel 傳遞（憲法 §4.1），主執行緒只持唯讀副本、不跨緒共享記憶體。
         RecentTokensUpdated(Vec<String>),
+        /// Edit Guard（`docs/design/edit-guard.md`）：printer 通知主執行緒「使用者接管」凍結
+        /// 狀態變化 → 切換 menu bar 圖示（`true`=凍結/暫停校正；`false`=恢復滾動）。
+        EditGuardFrozen(bool),
     }
 
     /// 把 `RaflowError` 映射到對應的 System Settings 深連結引導文字。
@@ -241,6 +245,8 @@ mod mac {
 
     fn run_printer(
         mut transcript_rx: UnboundedReceiver<TranscriptUpdate>,
+        mut activity_rx: UnboundedReceiver<()>,
+        edit_guard_frozen: Arc<std::sync::atomic::AtomicBool>,
         proxy: EventLoopProxy<UserEvent>,
     ) {
         let rt = match build_current_thread_rt() {
@@ -282,14 +288,54 @@ mod mac {
         // D1：本 session「最近注入英文 token」候選緩衝（記憶體、有上限、session 結束即棄）。
         // 每句定稿後 push，並把候選快照經 proxy 發布給主執行緒（更正 popover 的「聽成」下拉）。
         let mut recent_tokens = RecentTokens::new(RECENT_TOKENS_CAP);
+        // Edit Guard（docs/design/edit-guard.md）：錄音期間使用者移游標/手動編輯時凍結注入，
+        // 恢復說話（下一個 Partial）後以當前游標為新起點重置 printer。使用者活動事件由
+        // raflow-hotkey 全域監看經 activity_rx 送入（憲法 §4.1 channel），與 transcript 於此
+        // select! 匯流；狀態機純邏輯在 raflow-input::EditGuard（Phase 1，已測）。
+        let mut edit_guard = EditGuard::new();
+        // 本 session 是否滾動（有中途 PhraseFinal 段界）。只有滾動 session 才啟用 Edit Guard——
+        // 非滾動沒有段界可作恢復錨點，凍結會卡到錄音結束（且非滾動沒有「改中途定稿詞」情境）。
+        // 由 SessionStarted { rolling } 設定；預設 false（未收到前的保守值，不凍結）。
+        let mut session_rolling = false;
+        // activity_rx 的 sender clone 由主執行緒持有整個 app 生命週期 → 正常不會關閉；
+        // 防禦性：若真的關閉（None），停止再輪詢該分支避免 busy-loop。
+        let mut activity_open = true;
         rt.block_on(async move {
-            while let Some(update) = transcript_rx.recv().await {
+            loop {
+                let update = tokio::select! {
+                    maybe_update = transcript_rx.recv() => match maybe_update {
+                        Some(u) => u,
+                        None => break, // speech 側關閉 → 收工
+                    },
+                    maybe_activity = activity_rx.recv(), if activity_open => {
+                        match maybe_activity {
+                            // 只有滾動 session 才啟用守衛（見 session_rolling 說明）。非滾動忽略
+                            // 使用者活動 → 不凍結 → 維持現行注入行為，不會卡住。
+                            Some(()) if session_rolling => {
+                                // 使用者接管（滑鼠/任何按鍵）→ 凍結注入 + 通知主執行緒切圖示。
+                                // 同步共享旗標 → 後端 rolling_tick 改用極短門檻，加速清當前段草稿。
+                                let was_frozen = edit_guard.frozen();
+                                edit_guard.user_activity();
+                                edit_guard_frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+                                if !was_frozen {
+                                    let _ = proxy.send_event(UserEvent::EditGuardFrozen(true));
+                                }
+                            }
+                            Some(()) => {}
+                            None => activity_open = false,
+                        }
+                        continue;
+                    }
+                };
                 match update {
-                    TranscriptUpdate::SessionStarted => {
+                    TranscriptUpdate::SessionStarted { rolling } => {
                         // 新一輪錄音開始：清空鎖定前綴與草稿，避免上次殘留算出錯誤 backspace
                         // （spec/input.md §3）。reducer 回 no-op，不對已輸入內容 backspace。
                         replacements = load_replacements(); // 重讀 → 改檔即生效
+                        session_rolling = rolling; // Edit Guard 只在滾動 session 啟用（§7f）
                         focus_guard.session_started(frontmost_app_pid());
+                        edit_guard.recording_started(); // 新錄音回 ACTIVE，清除殘留凍結
+                        edit_guard_frozen.store(false, std::sync::atomic::Ordering::Relaxed);
                         let _ = printer.apply(PhraseEvent::SessionStarted);
                         let _ = proxy.send_event(UserEvent::OverlayText(None));
                         // 新錄音 session：候選緩衝清空（§9 隱私：不跨 session 殘留），並通知主執行緒清空。
@@ -298,12 +344,34 @@ mod mac {
                     }
                     TranscriptUpdate::Partial(text) => {
                         let text = apply_replacements(&text, &replacements);
-                        println!("~ {text}");
-                        let diff = printer.apply(PhraseEvent::Partial(&text));
-                        exec_inject_guarded(&mut focus_guard, &mut input, &diff);
-                        // Floating panel 顯示「已鎖定前綴 + 當前草稿」；面板自己 wrap，不截斷。
-                        let shown = format!("{}{}", printer.committed(), printer.last_partial());
-                        let _ = proxy.send_event(UserEvent::OverlayText(Some(shown)));
+                        // Edit Guard：依守衛動作處理（見 edit-guard.md §4）。恢復錨點＝printer 草稿為空
+                        // （段落交界的新段淨草稿）。
+                        // - Suppressed（接管中、草稿非空＝同段中途）：完全不動——不注入、不推進草稿，
+                        //   保持與畫面同步（使用者正在手改這一段）。
+                        // - Resumed（接管中、草稿已空＝段界後首個 partial）：從**空草稿**乾淨續接
+                        //   （diff 只 append 新段草稿、無 backspace、與畫面無重疊 → 無重複、無錯位）；
+                        //   同時重設 focus 基準 + 圖示切回錄音。使用者若在兩句之間接管，開口首句即恢復。
+                        // - Normal：照常滾動。
+                        match edit_guard.on_partial(printer.last_partial().is_empty()) {
+                            PartialAction::Suppressed => {
+                                // 靜默：不注入、不更新 overlay，等段界後的新段恢復。
+                            }
+                            action => {
+                                if action == PartialAction::Resumed {
+                                    focus_guard.session_started(frontmost_app_pid());
+                                    edit_guard_frozen
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    let _ = proxy.send_event(UserEvent::EditGuardFrozen(false));
+                                }
+                                println!("~ {text}");
+                                let diff = printer.apply(PhraseEvent::Partial(&text));
+                                exec_inject_guarded(&mut focus_guard, &mut input, &diff);
+                                // Floating panel 顯示「已鎖定前綴 + 當前草稿」；面板自己 wrap，不截斷。
+                                let shown =
+                                    format!("{}{}", printer.committed(), printer.last_partial());
+                                let _ = proxy.send_event(UserEvent::OverlayText(Some(shown)));
+                            }
+                        }
                     }
                     TranscriptUpdate::PhraseFinal(text) => {
                         // 句級定稿：對齊當前草稿 → 鎖定進 committed，草稿清空。session 續錄，
@@ -311,7 +379,11 @@ mod mac {
                         let text = apply_replacements(&text, &replacements);
                         println!("= {text}");
                         let diff = printer.apply(PhraseEvent::PhraseFinal(&text));
-                        exec_inject_guarded(&mut focus_guard, &mut input, &diff);
+                        // Edit Guard：接管中不注入定稿（使用者正在手改這一段，別蓋掉）。committed 仍
+                        // 前進（剪貼簿全文）；此定稿清空 printer 草稿，使下一個 partial 得以在新段恢復。
+                        if !edit_guard.frozen() {
+                            exec_inject_guarded(&mut focus_guard, &mut input, &diff);
+                        }
                         let shown = printer.committed().to_string();
                         let _ = proxy.send_event(UserEvent::OverlayText(Some(shown)));
                         // D1：句級定稿即注入完成 → 收進候選緩衝並發布快照。
@@ -323,7 +395,11 @@ mod mac {
                         let text = apply_replacements(&text, &replacements);
                         println!("= {text}");
                         let diff = printer.apply(PhraseEvent::Final(&text));
-                        exec_inject_guarded(&mut focus_guard, &mut input, &diff);
+                        // Edit Guard：接管中不注入收尾定稿（同 PhraseFinal）。剪貼簿全文照寫，
+                        // 使用者仍可 Cmd+V 取回；此定稿也清空草稿、讓下一個 partial 得以在新段恢復。
+                        if !edit_guard.frozen() {
+                            exec_inject_guarded(&mut focus_guard, &mut input, &diff);
+                        }
                         // 整段 = committed（含所有已鎖定句 + 本次收尾句）。
                         let whole = printer.committed().to_string();
                         if let Some(cb) = clipboard.as_mut() {
@@ -419,6 +495,7 @@ mod mac {
         transcript_tx: UnboundedSender<TranscriptUpdate>,
         proxy: EventLoopProxy<UserEvent>,
         user_settings: Arc<ArcSwap<Settings>>,
+        edit_guard_frozen: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), RaflowError> {
         let backend = AppleSpeechBackend::new(LOCALE)?;
         let backend = match try_load_whisper() {
@@ -432,6 +509,7 @@ mod mac {
         let gate_settings = user_settings.clone();
         let backend = backend
             .with_rolling(true)
+            .with_edit_guard_flag(edit_guard_frozen)
             .with_correction_gate(Arc::new(move || gate_settings.load().whisper_correction));
         if user_settings.load().whisper_correction {
             eprintln!(
@@ -514,6 +592,7 @@ mod mac {
         transcript_tx: UnboundedSender<TranscriptUpdate>,
         proxy: EventLoopProxy<UserEvent>,
         user_settings: Arc<ArcSwap<Settings>>,
+        edit_guard_frozen: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), RaflowError> {
         let rt = build_current_thread_rt()?;
         rt.block_on(worker_loop(
@@ -523,6 +602,7 @@ mod mac {
             transcript_tx,
             proxy,
             user_settings,
+            edit_guard_frozen,
         ))
     }
 
@@ -785,15 +865,25 @@ mod mac {
         let (hotkey_tx, hotkey_rx) = unbounded_channel::<HotkeyEvent>();
         let (audio_tx, audio_rx) = unbounded_channel::<AudioFrame>();
         let (transcript_tx, transcript_rx) = unbounded_channel::<TranscriptUpdate>();
+        // Edit Guard：使用者接管活動事件（滑鼠/任何按鍵）從主執行緒的全域監看送到 printer。
+        // 主執行緒保留 sender 整個生命週期（每次錄音 clone 給新 monitor），故 rx 端不會提前關閉。
+        let (activity_tx, activity_rx) = unbounded_channel::<()>();
+        // Edit Guard 接管中旗標：printer 寫（凍結/恢復）、worker 的後端 rolling_tick 讀（接管中改用
+        // 極短尾靜音門檻，加速清當前段草稿 → 使用者改完開口即刻恢復）。
+        let edit_guard_frozen = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let proxy_for_printer = proxy.clone();
+        let frozen_for_printer = edit_guard_frozen.clone();
         thread::Builder::new()
             .name("raflow-printer".into())
-            .spawn(move || run_printer(transcript_rx, proxy_for_printer))
+            .spawn(move || {
+                run_printer(transcript_rx, activity_rx, frozen_for_printer, proxy_for_printer)
+            })
             .map_err(|e| spawn_error(format!("spawn printer thread: {e}")))?;
 
         let proxy_for_worker = proxy.clone();
         let settings_for_worker = user_settings.clone();
+        let frozen_for_worker = edit_guard_frozen.clone();
         thread::Builder::new()
             .name("raflow-worker".into())
             .spawn(move || {
@@ -804,6 +894,7 @@ mod mac {
                     transcript_tx,
                     proxy_for_worker,
                     settings_for_worker,
+                    frozen_for_worker,
                 ) {
                     report_error("worker exited with error", &err);
                 }
@@ -849,6 +940,11 @@ mod mac {
         // D1：主執行緒持有的「最近注入英文 token」候選唯讀副本（printer 經 proxy 發布，見
         // UserEvent::RecentTokensUpdated）。只在主執行緒讀寫，不跨緒共享。供更正 popover 的下拉。
         let mut recent_tokens: Vec<String> = Vec::new();
+        // Edit Guard：錄音期間的使用者接管全域監看 handle（設計 §5/§7：隨錄音起停、只在
+        // 錄音期間啟用）。RecordingStarted 註冊、RecordingStopped drop。
+        let mut activity_monitor: Option<raflow_hotkey::ActivityMonitorHandle> = None;
+        // 目前是否錄音中：用來忽略「錄音已停但 channel 殘留的 EditGuardFrozen」避免 idle 時誤切圖示。
+        let mut is_recording = false;
 
         event_loop.run(move |event, _target, control_flow| {
             // 預設 wait；若有 pending hide 則 wait 到指定時間醒來收尾
@@ -884,9 +980,22 @@ mod mac {
                 }
                 Event::UserEvent(ue) => match ue {
                     UserEvent::RecordingStarted => {
+                        is_recording = true;
                         if let Some(tray) = tray.as_ref() {
                             tray.set_icon_as_template(false);
                             let _ = tray.set_icon(Some(recording_icon.clone()));
+                        }
+                        // Edit Guard：本次錄音啟動使用者接管監看（滑鼠/導覽鍵）。權限不足
+                        // （Input Monitoring 未授予）→ 監看註冊失敗，僅記 log，不阻斷錄音。
+                        match raflow_hotkey::register_activity_monitor(activity_tx.clone()) {
+                            // replace → 舊 handle（若有）在此 drop=removeMonitor，存新 handle。
+                            Ok(handle) => {
+                                let _ = activity_monitor.replace(handle);
+                            }
+                            Err(err) => {
+                                let _ = activity_monitor.take(); // 確保無殘留監看
+                                report_error("! edit guard 監看未啟用（使用者接管保護本次停用）", &err);
+                            }
                         }
                         // 在 session 起點 query 一次 focus，整個 session 內所有 partial /
                         // final 都用此 cached 結果決定是否彈 floating panel。避免每個
@@ -914,12 +1023,26 @@ mod mac {
                         }
                     }
                     UserEvent::RecordingStopped => {
+                        is_recording = false;
+                        // Edit Guard：停止監看（設計 §7 隱私：只在錄音期間啟用）。take → drop → removeMonitor。
+                        let _ = activity_monitor.take();
                         if let Some(tray) = tray.as_ref() {
                             tray.set_icon_as_template(true);
                             let _ = tray.set_icon(Some(idle_icon.clone()));
                         }
                         // 不立即 hide overlay：let Final 抵達後的 ScheduleHide 處理。
                         // 若使用者極短錄音沒收到 Final，下一次 SessionStarted 會 clear+重 show。
+                    }
+                    UserEvent::EditGuardFrozen(frozen) => {
+                        // 使用者接管凍結指示（設計 §4：低調 menu bar 圖示，不彈 HUD）。
+                        // 暫以「錄音圖示 as template」當暫停變體（單色/黯淡 vs 錄音的紅），
+                        // 恢復時切回全彩紅。僅在錄音中套用，忽略停錄後殘留事件。
+                        if is_recording {
+                            if let Some(tray) = tray.as_ref() {
+                                tray.set_icon_as_template(frozen);
+                                let _ = tray.set_icon(Some(recording_icon.clone()));
+                            }
+                        }
                     }
                     UserEvent::OverlayText(text) => {
                         // Menu bar 不顯示文字（使用者反饋：太擾人）；只用紅色圖示切換做狀態

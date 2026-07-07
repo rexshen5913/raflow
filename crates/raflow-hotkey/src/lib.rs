@@ -6,11 +6,15 @@
 //! 對外 API：
 //! - `register(tx) -> Result<HotkeyHandle, RaflowError>`：必須於主執行緒呼叫
 //! - `HotkeyHandle` drop 時自動 removeMonitor
+//! - `register_activity_monitor(tx) -> Result<ActivityMonitorHandle, RaflowError>`：
+//!   Edit Guard v1——錄音期間監看「使用者接管」信號（滑鼠按下 / 導覽鍵），
+//!   drop 時自動 removeMonitor。純判定邏輯放在 `activity` 模組（無 unsafe）。
 
+mod activity;
 mod double_tap;
 
 #[cfg(target_os = "macos")]
 mod nsevent_monitor;
 
 #[cfg(target_os = "macos")]
-pub use nsevent_monitor::{HotkeyHandle, register};
+pub use nsevent_monitor::{ActivityMonitorHandle, HotkeyHandle, register, register_activity_monitor};

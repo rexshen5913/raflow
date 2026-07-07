@@ -414,6 +414,10 @@ pub struct AppleSpeechBackend {
     /// 本次 session 滾動是否生效（`start()` 時以 [`rolling_session_active`] 定案）：
     /// 能力齊備、VAD 模型在、且 zh-TW session 才滾動。否則 Apple final 直出。
     session_rolling: bool,
+    /// Edit Guard 是否接管中（printer 執行緒寫、rolling_tick 讀）。接管中 → 用極短尾靜音門檻
+    /// 盡快定稿當前段、清空草稿，讓下次開口即刻恢復（docs/design/edit-guard.md §4）。預設一個
+    /// 獨立 flag（恆 false）；由 `with_edit_guard_flag` 注入 app 層共享的那個。
+    edit_guard_frozen: Arc<AtomicBool>,
     /// Apple 整段 final 是否抑制（與 callback 共享）。滾動 session 於 `start()` 設
     /// true；收尾 flush **失敗**（守門拒收/空輸出/核心錯誤）時清為 false → 稍後
     /// 抵達的 Apple final 以未定稿尾段回退直出，避免空 `Final` 清掉草稿（資料遺失）。
@@ -468,6 +472,7 @@ impl AppleSpeechBackend {
             correction_gate: None,
             session_correction: true,
             session_rolling: false,
+            edit_guard_frozen: Arc::new(AtomicBool::new(false)),
             suppress_apple_final: Arc::new(AtomicBool::new(false)),
             apple_partial_text: Arc::new(Mutex::new(String::new())),
             restore_vocab: Vec::new(),
@@ -518,6 +523,13 @@ impl AppleSpeechBackend {
     /// Apple 整段 final、裁切 partial 前綴（ADR-0006 §8.7.2）。需 `whisper` + VAD model 才生效。
     pub fn with_rolling(mut self, enabled: bool) -> Self {
         self.rolling = enabled;
+        self
+    }
+
+    /// Builder：注入 app 層與 printer 共享的「Edit Guard 接管中」旗標。接管中 rolling_tick 改用
+    /// 極短尾靜音門檻，盡快清空當前段草稿 → 使用者改完開口即刻恢復（edit-guard.md §4）。
+    pub fn with_edit_guard_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.edit_guard_frozen = flag;
         self
     }
 
@@ -865,6 +877,12 @@ impl SpeechBackend for AppleSpeechBackend {
         Ok(())
     }
 
+    /// 本 session 是否句級滾動（`start` 定案的 `session_rolling`：能力 + VAD + zh-TW）。
+    /// 供 Edit Guard 只在有中途 `PhraseFinal` 段界的 session 啟用（見 spec/input.md §7f）。
+    fn session_rolling(&self) -> bool {
+        self.session_rolling
+    }
+
     /// Phase 2 句級滾動 tick（ADR-0006 §8.7.2）。`rolling=false`（預設）→ 立即 no-op，
     /// 現行行為完全不變。ON 時：
     /// 1. 快照累積 PCM（clone，不 drain；定稿進度靠 `finalized_samples` 樣本位置游標追蹤）；
@@ -906,6 +924,8 @@ impl SpeechBackend for AppleSpeechBackend {
             self.finalized_samples,
             is_final,
             Some(&term_refs),
+            // Edit Guard 接管中 → 極短門檻加速清當前段草稿（清空後下次開口即恢復）。
+            self.edit_guard_frozen.load(Ordering::Relaxed),
         ) {
             Ok(o) => o,
             Err(e) => {

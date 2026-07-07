@@ -20,4 +20,11 @@ pub trait SpeechBackend {
     fn rolling_tick(&mut self, _is_final: bool) -> Result<(), RaflowError> {
         Ok(())
     }
+
+    /// 本 session（`start` 之後）是否為句級滾動——即會產生中途 `PhraseFinal` 段界。
+    /// 供 Edit Guard 判定是否啟用（只在有段界可作恢復錨點的 session 啟用）。
+    /// 預設 `false`（非滾動 backend / fake）；`AppleSpeechBackend` 依 `session_rolling` 回報。
+    fn session_rolling(&self) -> bool {
+        false
+    }
 }

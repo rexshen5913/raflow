@@ -13,6 +13,7 @@ tokio.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
-objc2-app-kit = { workspace = true, features = ["NSEvent", "NSResponder"] }
+objc2-app-kit = { workspace = true, features = ["NSEvent", "NSResponder", "objc2-core-graphics"] }
+objc2-core-graphics = { workspace = true, features = ["CGEventTypes"] }
 objc2-foundation = { workspace = true, features = ["NSObject"] }
 block2.workspace = true

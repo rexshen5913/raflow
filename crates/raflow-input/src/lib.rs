@@ -522,6 +522,81 @@ impl FocusGuard {
     }
 }
 
+/// `EditGuard::on_partial` 的判定結果——呼叫端據此決定如何處理這個 partial。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialAction {
+    /// 未接管：照常滾動注入。
+    Normal,
+    /// 接管中、且 printer 草稿**非空**（仍在使用者手改的那一段中途）：**不注入**、不推進草稿。
+    Suppressed,
+    /// 接管中、且 printer 草稿**已空**（正在段落交界，下一句是新段淨草稿）→ 解凍並照常從空草稿
+    /// 注入（新段與畫面無重疊，天然無重複；呼叫端另做 refocus / 圖示切換）。
+    Resumed,
+}
+
+/// 使用者接管守衛（edit-guard.md；純狀態機，無 I/O、無 unsafe）。
+///
+/// 問題：使用者錄音中發現已定稿的詞要改，於是**不說話、直接移游標或手動編輯**。
+/// 此時 raflow 內部記的游標／草稿已與畫面脫節，若照常滾動 backspace 會從新游標往回刪 →
+/// 毀掉剛改的字。macOS 無可靠 API 讀回輸入框內容（`input.md §8`），故走「粗粒度但可靠」：
+/// 偵測到接管 → **凍結**注入；直到 printer 的**草稿為空**（正好在段落交界）時的下一個 partial
+/// 才恢復——此時從**空草稿**注入，與畫面無重疊，天然無重複、無錯位。
+///
+/// 為何以「草稿是否為空」為恢復錨點（而非「接管後下一個 partial 立刻恢復」）：使用者已移游標，
+/// 任何相對凍結前草稿的 diff／backspace 都可能刪到手改內容或重打已在畫面的前綴；只有**空草稿**
+/// 時的新段 partial（已 `strip_committed_prefix`）才與畫面無重疊、可乾淨續接。
+/// 用「草稿空」而非「接管後已過一次段界」的好處：使用者若在**兩句之間**接管（草稿本就已空），
+/// 開口說的**第一句**即可恢復，不必先被吞掉一句、等下一個段界（原設計的過度保守，已修正）。
+///
+/// 守衛語意（見 edit-guard.md §4 / §6）：
+/// - `recording_started()`：新錄音起點，重置為 ACTIVE。
+/// - `user_activity()`：偵測到使用者輸入（滑鼠／任何按鍵）→ 進 FROZEN。冪等。
+/// - `on_partial(draft_empty) -> PartialAction`：見 [`PartialAction`]；`draft_empty` 由呼叫端傳入
+///   `printer.last_partial().is_empty()`。
+/// - `frozen() -> bool`：目前是否抑制注入（`PhraseFinal`/`Final` 注入前查詢）。
+///
+/// committed 已鎖定的句子本就不被 backspace（ADR-0006 不變式），不受本守衛影響。
+#[derive(Debug, Default, Clone)]
+pub struct EditGuard {
+    frozen: bool,
+}
+
+impl EditGuard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 新錄音起點：清除上一段殘留的狀態（回到 ACTIVE）。
+    pub fn recording_started(&mut self) {
+        self.frozen = false;
+    }
+
+    /// 偵測到使用者接管（滑鼠／任何按鍵）→ 凍結注入。冪等：狂點/連打多次仍只需一次恢復。
+    pub fn user_activity(&mut self) {
+        self.frozen = true;
+    }
+
+    /// 語音 partial 抵達 → 回傳處理動作（見 [`PartialAction`]）。`draft_empty` = printer 的
+    /// `last_partial` 是否為空（正好在段落交界 → 新段淨草稿可乾淨續接）。
+    pub fn on_partial(&mut self, draft_empty: bool) -> PartialAction {
+        if !self.frozen {
+            PartialAction::Normal
+        } else if draft_empty {
+            // 段落交界的新段淨草稿 → 乾淨恢復。
+            self.frozen = false;
+            PartialAction::Resumed
+        } else {
+            // 仍在使用者手改的那一段中途（草稿非空）→ 不注入。
+            PartialAction::Suppressed
+        }
+    }
+
+    /// 目前是否抑制注入。
+    pub fn frozen(&self) -> bool {
+        self.frozen
+    }
+}
+
 /// 文字注入介面。測試以 `FakeBackend` 替代，生產環境使用 [`EnigoBackend`]。
 pub trait InputBackend {
     /// 鍵入文字到目前 focus 的輸入框。
@@ -568,7 +643,13 @@ mod mac {
 
     impl EnigoBackend {
         pub fn new() -> Result<Self, RaflowError> {
-            let enigo = Enigo::new(&Settings::default()).map_err(|e| RaflowError::TextInject {
+            // 標記所有注入事件的 kCGEventSourceUserData 為 RAFLOW_INJECT_MARKER，讓 Edit Guard
+            // 的活動監看能自我濾除 raflow 自身注入的按鍵（見 raflow_core::RAFLOW_INJECT_MARKER）。
+            let settings = Settings {
+                event_source_user_data: Some(raflow_core::RAFLOW_INJECT_MARKER),
+                ..Settings::default()
+            };
+            let enigo = Enigo::new(&settings).map_err(|e| RaflowError::TextInject {
                 detail: format!("failed to init enigo: {e}"),
             })?;
             Ok(Self { enigo })
@@ -1479,6 +1560,121 @@ K8S => Kubernetes\n";
         assert!(
             guard.should_inject(Some(200)),
             "new session with new baseline injects again"
+        );
+    }
+
+    // ===== EditGuard（使用者接管守衛；edit-guard.md 純狀態機）=====
+
+    /// 決策表：每列為一段錄音——`recording_started()` 後依序套用操作，斷言 `on_partial(draft_empty)`
+    /// 的動作與其後 `frozen()`。核心語意（見 edit-guard.md §4 / §8）：
+    /// - 未接管：partial 恆 `Normal`、不凍結（不論草稿空否）。
+    /// - `user_activity`（滑鼠／任何按鍵）→ 凍結。
+    /// - 凍結中、草稿**非空**（同段中途）的 partial → `Suppressed`（不注入、仍凍結）。
+    /// - 凍結中、草稿**已空**（段落交界）的首個 partial → `Resumed`（解凍、從空草稿續接）；之後 `Normal`。
+    /// - 多次 `user_activity`（連打）冪等。
+    #[test]
+    fn edit_guard_decision_table() {
+        #[derive(Clone, Copy)]
+        enum Step {
+            /// 使用者活動；斷言其後 `frozen()`。
+            Activity(bool),
+            /// 語音 partial 抵達；(draft_empty, 期望 on_partial 動作, 其後 frozen())。
+            Partial(bool, PartialAction, bool),
+        }
+        use PartialAction::{Normal, Resumed, Suppressed};
+        use Step::{Activity, Partial};
+
+        let cases: &[(&str, &[Step])] = &[
+            (
+                "no takeover: partials normal regardless of draft",
+                &[
+                    Partial(false, Normal, false),
+                    Partial(true, Normal, false),
+                ],
+            ),
+            (
+                "takeover mid-segment (draft non-empty): suppress until draft empties, then resume",
+                &[
+                    Activity(true),
+                    Partial(false, Suppressed, true), // 同段中途 → 抑制
+                    Partial(false, Suppressed, true),
+                    Partial(true, Resumed, false), // 草稿已空（段界過後）→ 恢復
+                    Partial(false, Normal, false),
+                ],
+            ),
+            (
+                "takeover between utterances (draft already empty): first utterance resumes at once",
+                &[
+                    Activity(true),
+                    Partial(true, Resumed, false), // 接管當下草稿已空 → 首句即恢復（修正吞字）
+                    Partial(false, Normal, false),
+                ],
+            ),
+            (
+                "repeated activity is idempotent",
+                &[
+                    Activity(true),
+                    Activity(true),
+                    Activity(true),
+                    Partial(true, Resumed, false),
+                ],
+            ),
+            (
+                "re-freeze after resume (self-healing)",
+                &[
+                    Activity(true),
+                    Partial(true, Resumed, false),
+                    Activity(true), // 再次接管
+                    Partial(false, Suppressed, true),
+                    Partial(true, Resumed, false),
+                ],
+            ),
+        ];
+
+        for (label, steps) in cases {
+            let mut guard = EditGuard::new();
+            guard.recording_started();
+            assert!(!guard.frozen(), "{label}: fresh recording is not frozen");
+            for (i, step) in steps.iter().enumerate() {
+                match step {
+                    Activity(expect_frozen) => {
+                        guard.user_activity();
+                        assert_eq!(
+                            guard.frozen(),
+                            *expect_frozen,
+                            "{label}: step {i} after user_activity"
+                        );
+                    }
+                    Partial(draft_empty, expect_action, expect_frozen) => {
+                        assert_eq!(
+                            guard.on_partial(*draft_empty),
+                            *expect_action,
+                            "{label}: step {i} on_partial(draft_empty={draft_empty})"
+                        );
+                        assert_eq!(
+                            guard.frozen(),
+                            *expect_frozen,
+                            "{label}: step {i} frozen after on_partial"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `recording_started` 必須重置上一段殘留的凍結（新錄音從 ACTIVE 起算）。
+    #[test]
+    fn edit_guard_recording_started_resets_state() {
+        let mut guard = EditGuard::new();
+        guard.recording_started();
+        guard.user_activity();
+        assert!(guard.frozen(), "activity freezes");
+        guard.recording_started();
+        assert!(!guard.frozen(), "new recording clears leftover freeze");
+        assert_eq!(
+            guard.on_partial(false),
+            PartialAction::Normal,
+            "new recording: partial is normal even with non-empty draft"
         );
     }
 }

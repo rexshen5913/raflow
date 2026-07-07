@@ -299,11 +299,20 @@ pub const ROLLING_PENDING_SPEECH_FAST_LOCK: usize = 80_000;
 /// 留給下一句併入（更多上下文）或 is_final 收尾（不看門檻）處理。
 pub const ROLLING_MIN_LOCK_SPEECH: usize = 24_000;
 
-/// 依「未定稿語音累積樣本數」回傳鎖定門檻（自適應三段，真人錄音實證定調——
-/// 句間停頓 1.17~1.39s vs 句內思考停頓 1.6s 重疊，單一門檻無法分離；孤兒短片段
-/// 單獨鎖定必產生退化輸出。見上方常數 doc）。`usize::MAX` = 本 tick 永不因靜音鎖定。
-pub fn rolling_trailing_silence_for(pending_speech_samples: usize) -> usize {
-    if pending_speech_samples < ROLLING_MIN_LOCK_SPEECH {
+/// Edit Guard 接管中的鎖定門檻（0.4s @ 16 kHz）。使用者已停說改字、**不會續這句**，故無
+/// 「句內思考停頓誤鎖」顧慮 → 用極短門檻盡快把當前段定稿、清空 printer 草稿，讓下次開口即刻
+/// 恢復（見 docs/design/edit-guard.md §4「恢復錨點＝草稿為空」）。亦**不看** `ROLLING_MIN_LOCK_SPEECH`
+/// （接管中連短段也要清，該段本就不注入、品質無所謂）。
+pub const ROLLING_TRAILING_SILENCE_FROZEN: usize = 6_400;
+
+/// 依「未定稿語音累積樣本數」回傳鎖定門檻。`frozen`（Edit Guard 接管中）→ 極短門檻加速清草稿
+/// （見 [`ROLLING_TRAILING_SILENCE_FROZEN`]）；否則自適應三段（真人錄音實證定調——句間停頓
+/// 1.17~1.39s vs 句內思考停頓 1.6s 重疊，單一門檻無法分離；孤兒短片段單獨鎖定必產生退化輸出。
+/// 見上方常數 doc）。`usize::MAX` = 本 tick 永不因靜音鎖定。
+pub fn rolling_trailing_silence_for(pending_speech_samples: usize, frozen: bool) -> usize {
+    if frozen {
+        ROLLING_TRAILING_SILENCE_FROZEN
+    } else if pending_speech_samples < ROLLING_MIN_LOCK_SPEECH {
         usize::MAX
     } else if pending_speech_samples >= ROLLING_PENDING_SPEECH_FAST_LOCK {
         ROLLING_TRAILING_SILENCE_FAST
@@ -351,6 +360,7 @@ pub fn rolling_tick_core(
     finalized_samples: usize,
     is_final: bool,
     prompt_terms: Option<&[&str]>,
+    frozen: bool,
 ) -> Result<RollingTickOutcome, RaflowError> {
     let mut out = RollingTickOutcome {
         phrase: None,
@@ -375,7 +385,7 @@ pub fn rolling_tick_core(
         &segment_ends,
         pcm.len(),
         0, // pending 已排除定稿段 → 游標恆從 0 起
-        rolling_trailing_silence_for(pending_speech),
+        rolling_trailing_silence_for(pending_speech, frozen),
         is_final,
     );
     if range.is_empty() {
@@ -1209,9 +1219,15 @@ mod tests {
         ];
         for (pending, expected) in cases.iter().copied() {
             assert_eq!(
-                rolling_trailing_silence_for(pending),
+                rolling_trailing_silence_for(pending, false),
                 expected,
-                "rolling_trailing_silence_for({pending})"
+                "rolling_trailing_silence_for({pending}, frozen=false)"
+            );
+            // Edit Guard 接管中：恆用極短門檻，且不看 min-lock（連短段也要清）。
+            assert_eq!(
+                rolling_trailing_silence_for(pending, true),
+                ROLLING_TRAILING_SILENCE_FROZEN,
+                "rolling_trailing_silence_for({pending}, frozen=true)"
             );
         }
     }
