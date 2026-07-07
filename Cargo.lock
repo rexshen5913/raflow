@@ -2160,7 +2160,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raflow-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "image",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "raflow-audio"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cpal",
  "raflow-core",
@@ -2192,14 +2192,14 @@ dependencies = [
 
 [[package]]
 name = "raflow-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "raflow-hotkey"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "block2",
  "objc2",
@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "raflow-input"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arboard",
  "enigo",
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "raflow-speech"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "block2",
  "ferrous-opencc",
