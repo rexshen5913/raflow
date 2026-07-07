@@ -283,15 +283,19 @@ pub fn is_prompt_echo(text: &str, prompt_terms: &[&str]) -> bool {
         .any(|pair| text.contains(&format!("{}、{}", pair[0], pair[1])))
 }
 
-/// 滾動鎖定**基礎**門檻：最後語音段結束後需累積的靜音樣本數（2.0s @ 16 kHz）。
-/// 須大於實測句內思考停頓（~1.6s）——但真人錄音實證句間停頓僅 1.17~1.39s，單一門檻
-/// 無法兩全 → 以 [`rolling_trailing_silence_for`] 依累積語音長度自適應調降。
-pub const ROLLING_TRAILING_SILENCE_SAMPLES: usize = 32_000;
+/// 滾動鎖定**基礎**門檻：最後語音段結束後需累積的靜音樣本數（1.6s @ 16 kHz）。
+/// 定在**句內思考停頓上緣**（真人錄音實證 ~1.6s）——大於等於它，避免講到一半停頓思考被
+/// 提前拆句（拆句會讓 Whisper 分兩次轉半句、失去上下文 → 術語/標點退化）；同時比舊 2.0s
+/// 更快落地鎖定、即時感更強。
+/// **已知取捨**：1.6s 仍高於實測句間停頓 1.17~1.39s → 短句（此帶）遇這種停頓不會鎖，下一句
+/// 會併入同一 pending span（靠 ≥5s 快速門檻或 is_final 收尾兜底）。併句是較安全的失效方向
+/// （更多上下文＝轉錄更準），可接受（見 whisper.md）。
+pub const ROLLING_TRAILING_SILENCE_SAMPLES: usize = 25_600;
 /// 快速鎖定門檻（1.0s）：未定稿語音已累積夠長時採用。搭配 1s tick 節奏，句內
 /// ≤0.95s 的小停頓在下個 tick 前必被新語音填補，不會誤觸。
 pub const ROLLING_TRAILING_SILENCE_FAST: usize = 16_000;
 /// 「未定稿語音累積達此量（5s）→ 改用快速門檻」。一句講到 5 秒以上，任何像樣的
-/// 停頓都是可信的句界；反之剛開口的短內容用基礎門檻，防句內思考停頓提前鎖
+/// 停頓都是可信的句界；反之剛開口的短內容用（較長的）基礎門檻，減少短片段被提前鎖
 /// （短片段轉錄品質差、且 committed 邊界近似誤差大）。
 pub const ROLLING_PENDING_SPEECH_FAST_LOCK: usize = 80_000;
 /// 「未定稿語音低於此量（1.5s）→ 永不因靜音鎖定」。真人錄音實測：孤兒短片段
@@ -306,9 +310,10 @@ pub const ROLLING_MIN_LOCK_SPEECH: usize = 24_000;
 pub const ROLLING_TRAILING_SILENCE_FROZEN: usize = 6_400;
 
 /// 依「未定稿語音累積樣本數」回傳鎖定門檻。`frozen`（Edit Guard 接管中）→ 極短門檻加速清草稿
-/// （見 [`ROLLING_TRAILING_SILENCE_FROZEN`]）；否則自適應三段（真人錄音實證定調——句間停頓
-/// 1.17~1.39s vs 句內思考停頓 1.6s 重疊，單一門檻無法分離；孤兒短片段單獨鎖定必產生退化輸出。
-/// 見上方常數 doc）。`usize::MAX` = 本 tick 永不因靜音鎖定。
+/// （見 [`ROLLING_TRAILING_SILENCE_FROZEN`]）；否則自適應三段（句間停頓 1.17~1.39s vs 句內思考
+/// 停頓 ~1.6s 重疊，單一門檻無法乾淨分離——基礎門檻取 1.6s 定在句內停頓上緣，見
+/// [`ROLLING_TRAILING_SILENCE_SAMPLES`] doc 的取捨說明；孤兒短片段單獨鎖定必產生退化輸出）。
+/// `usize::MAX` = 本 tick 永不因靜音鎖定。
 pub fn rolling_trailing_silence_for(pending_speech_samples: usize, frozen: bool) -> usize {
     if frozen {
         ROLLING_TRAILING_SILENCE_FROZEN
@@ -1200,8 +1205,9 @@ mod tests {
     }
 
     /// 自適應鎖定門檻（真人錄音實證）：句間停頓實測僅 1.17~1.39s、
-    /// 句內思考停頓可達 1.6s——單一門檻無法分離。解法：累積語音越長門檻越低——
-    /// 累積 <5s → 2.0s（防句內思考停頓提前鎖）；≥5s → 1.0s（長句後任何像樣停頓即鎖）。
+    /// 句內思考停頓可達 ~1.6s——單一門檻無法分離。解法：累積語音越長門檻越低——
+    /// 累積 <5s → 1.6s（定在句內停頓上緣，見 `ROLLING_TRAILING_SILENCE_SAMPLES` doc）；
+    /// ≥5s → 1.0s（長句後任何像樣停頓即鎖）。
     #[test]
     fn rolling_trailing_silence_scales_with_pending_speech() {
         // (pending_speech_samples, expected_threshold_samples)
@@ -1212,8 +1218,8 @@ mod tests {
             (0, usize::MAX),
             (16_000, usize::MAX), // 1.0s → 不鎖
             (23_999, usize::MAX), // 差 1 sample 到 1.5s → 不鎖
-            (24_000, 32_000),     // 恰 1.5s → 基礎門檻 2.0s
-            (79_999, 32_000),     // 差 1 sample 到 5s → 仍 2.0s
+            (24_000, 25_600),     // 恰 1.5s（min-lock）→ 基礎門檻 1.6s
+            (79_999, 25_600),     // 差 1 sample 到 5s → 仍 1.6s
             (80_000, 16_000),     // 恰 5s → 快速門檻 1.0s
             (160_000, 16_000),    // 10s → 1.0s
         ];
@@ -1228,6 +1234,44 @@ mod tests {
                 rolling_trailing_silence_for(pending, true),
                 ROLLING_TRAILING_SILENCE_FROZEN,
                 "rolling_trailing_silence_for({pending}, frozen=true)"
+            );
+        }
+    }
+
+    /// 二階行為（`rolling_trailing_silence_for` × `segments_ready_to_finalize` 組合，如
+    /// `rolling_tick_core` 實際串接）：對 `1.5s ≤ pending < 5s` 的**短句**，實測句間停頓
+    /// 1.17~1.39s（乃至 1.5s）**仍不足以**觸發鎖定（下一句會併入同一 pending span）；須累積
+    /// ≥ 基礎門檻 1.6s 的段末靜音才落地鎖定。釘住本版取捨：1.6s 基礎門檻**不保證**鎖住
+    /// 1.17~1.39s 句間停頓，但把門檻定在句內思考停頓上緣（~1.6s）以避免提前拆句
+    /// （見 `ROLLING_TRAILING_SILENCE_SAMPLES` doc / whisper.md）。
+    #[test]
+    fn short_sentence_inter_pause_below_base_threshold_merges_not_locks() {
+        const SR: usize = 16_000;
+        // 一句短語音：2.0s 語音落在短句帶 [1.5s, 5s) → 基礎門檻 1.6s。
+        let sentence_speech = 2 * SR; // 32_000 samples pending_speech
+        let seg_ends = [sentence_speech];
+        let threshold = rolling_trailing_silence_for(sentence_speech, false);
+        assert_eq!(
+            threshold, ROLLING_TRAILING_SILENCE_SAMPLES,
+            "短句帶應取基礎門檻 1.6s"
+        );
+        // (段末靜音 samples, 該版預期是否鎖定)
+        let cases: &[(usize, bool)] = &[
+            (18_720, false), // 1.17s 句間停頓下緣 → 不鎖，下一句併入
+            (22_240, false), // 1.39s 句間停頓上緣 → 仍不鎖
+            (24_000, false), // 1.5s → 仍低於 1.6s 門檻，不鎖
+            (25_599, false), // 差 1 sample 到 1.6s → 仍不鎖
+            (25_600, true),  // 恰 1.6s（句內思考停頓上緣）→ 落地鎖定
+            (27_200, true),  // 1.7s → 鎖定
+        ];
+        for (pause, expect_lock) in cases.iter().copied() {
+            let buffer_len = sentence_speech + pause;
+            let range = segments_ready_to_finalize(&seg_ends, buffer_len, 0, threshold, false);
+            assert_eq!(
+                !range.is_empty(),
+                expect_lock,
+                "段末靜音 {pause} samples（{:.2}s）",
+                pause as f32 / SR as f32
             );
         }
     }
