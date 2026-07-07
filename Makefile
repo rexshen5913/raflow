@@ -61,6 +61,8 @@ icons:
 	rsvg-convert -w 44 -h 44 $(ICONS_DIR)/menubar-idle.svg      -o $(ICONS_DIR)/menubar-idle@2x.png
 	rsvg-convert -w 22 -h 22 $(ICONS_DIR)/menubar-recording.svg -o $(ICONS_DIR)/menubar-recording.png
 	rsvg-convert -w 44 -h 44 $(ICONS_DIR)/menubar-recording.svg -o $(ICONS_DIR)/menubar-recording@2x.png
+	rsvg-convert -w 22 -h 22 $(ICONS_DIR)/menubar-frozen.svg    -o $(ICONS_DIR)/menubar-frozen.png
+	rsvg-convert -w 44 -h 44 $(ICONS_DIR)/menubar-frozen.svg    -o $(ICONS_DIR)/menubar-frozen@2x.png
 
 # 建立 self-signed Code Signing 憑證（idempotent；已存在會跳過）。
 # 所有 bundle target 依賴此 target，保證 codesign 用得到 raflow-dev cert。

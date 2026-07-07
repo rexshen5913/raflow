@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Edit Guard 接管中（暫停）：琥珀色 mic + 正方形外框內含暫停雙槓（非 template，不被 macOS tint）。
+     色相與形狀雙重區隔——錄音=紅圓點、暫停=琥珀方框、閒置=灰描邊 mic。 -->
+<svg width="44" height="44" viewBox="0 0 44 44" xmlns="http://www.w3.org/2000/svg">
+  <!-- Mic body：琥珀色（macOS 系統橘 #FF9500）-->
+  <g transform="translate(22, 19)">
+    <path d="M 0 -11 L 6 -7 L 6 7 L 0 11 L -6 7 L -6 -7 Z" fill="#FF9500"/>
+  </g>
+  <!-- stand + base -->
+  <rect x="21" y="31" width="2" height="5" fill="#FF9500"/>
+  <rect x="15" y="35" width="14" height="3" rx="1" fill="#FF9500"/>
+
+  <!-- 暫停徽章：正方形外框（圓角）+ 內含兩根暫停槓；置於錄音點原位（34,10）-->
+  <g transform="translate(34, 10)">
+    <rect x="-8" y="-8" width="16" height="16" rx="3.5" fill="#FFF3E0"
+          stroke="#FF9500" stroke-width="2.2"/>
+    <rect x="-3.6" y="-4" width="2.6" height="8" rx="0.8" fill="#E07800"/>
+    <rect x="1.0"  y="-4" width="2.6" height="8" rx="0.8" fill="#E07800"/>
+  </g>
+</svg>

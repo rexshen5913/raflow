@@ -84,6 +84,8 @@ mod mac {
     const ICON_IDLE: &[u8] = include_bytes!("../../../packaging/icons/menubar-idle@2x.png");
     const ICON_RECORDING: &[u8] =
         include_bytes!("../../../packaging/icons/menubar-recording@2x.png");
+    /// Edit Guard 接管中（暫停）圖示：琥珀色 mic + 正方形外框暫停徽章（非 template）。
+    const ICON_FROZEN: &[u8] = include_bytes!("../../../packaging/icons/menubar-frozen@2x.png");
 
     /// tao 自訂事件：worker / menu / printer 透過 `EventLoopProxy` 發送給主執行緒。
     #[derive(Debug, Clone)]
@@ -839,6 +841,7 @@ mod mac {
 
         let idle_icon = decode_icon(ICON_IDLE, "idle")?;
         let recording_icon = decode_icon(ICON_RECORDING, "recording")?;
+        let frozen_icon = decode_icon(ICON_FROZEN, "frozen")?;
 
         // 先設 activation policy 再 build EventLoop：sharedApplication 會 init NSApplication
         // singleton（若尚未存在），policy 在 tao 初始化 event loop 前就落地。
@@ -1035,12 +1038,13 @@ mod mac {
                     }
                     UserEvent::EditGuardFrozen(frozen) => {
                         // 使用者接管凍結指示（設計 §4：低調 menu bar 圖示，不彈 HUD）。
-                        // 暫以「錄音圖示 as template」當暫停變體（單色/黯淡 vs 錄音的紅），
-                        // 恢復時切回全彩紅。僅在錄音中套用，忽略停錄後殘留事件。
+                        // 專屬圖示：凍結＝琥珀 mic + 正方形外框暫停徽章；恢復＝全彩紅錄音點。
+                        // 皆全彩（非 template）。僅在錄音中套用，忽略停錄後殘留事件。
                         if is_recording {
                             if let Some(tray) = tray.as_ref() {
-                                tray.set_icon_as_template(frozen);
-                                let _ = tray.set_icon(Some(recording_icon.clone()));
+                                tray.set_icon_as_template(false);
+                                let icon = if frozen { &frozen_icon } else { &recording_icon };
+                                let _ = tray.set_icon(Some(icon.clone()));
                             }
                         }
                     }
