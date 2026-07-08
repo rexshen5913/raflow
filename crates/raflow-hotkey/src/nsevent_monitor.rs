@@ -44,7 +44,14 @@ impl Drop for HotkeyHandle {
     }
 }
 
-pub fn register(tx: UnboundedSender<HotkeyEvent>) -> Result<HotkeyHandle, RaflowError> {
+/// 註冊雙擊 Cmd 偵測。`on_toggle` 於**每次雙擊命中時、在主執行緒**（NSEvent global monitor 的
+/// callback 由主 run loop 派送）被呼叫一次，緊接在送出 [`HotkeyEvent::Pressed`] 之前——供呼叫端
+/// 在**主執行緒**取樣需要主執行緒的狀態（例如 Carbon TIS 讀當前輸入法選 speech locale；見 ADR-0007，
+/// 避免 worker thread 跨執行緒呼叫 TIS 觸發 `dispatch_assert_queue` 崩潰）。
+pub fn register<F: Fn() + 'static>(
+    tx: UnboundedSender<HotkeyEvent>,
+    on_toggle: F,
+) -> Result<HotkeyHandle, RaflowError> {
     // 確認主執行緒。NSEvent global monitor 的 callback 由主 run loop 派送，
     // 註冊呼叫亦應於主執行緒；非主執行緒呼叫即為使用者錯誤。
     let _mtm = MainThreadMarker::new().ok_or_else(|| RaflowError::HotkeyRegister {
@@ -80,6 +87,9 @@ pub fn register(tx: UnboundedSender<HotkeyEvent>) -> Result<HotkeyHandle, Raflow
                     if cmd_now != *cmd_was {
                         if cmd_now {
                             if det.on_cmd_down(now) {
+                                // 雙擊命中：此 callback 於**主執行緒**執行，先讓呼叫端在主執行緒
+                                // 取樣（如 TIS 讀輸入法，ADR-0007），再送事件給 worker。
+                                on_toggle();
                                 let _ = tx.send(HotkeyEvent::Pressed);
                             }
                         } else {

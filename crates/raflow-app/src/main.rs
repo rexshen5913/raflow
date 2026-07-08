@@ -33,6 +33,9 @@ mod floating_overlay;
 mod input_source;
 
 #[cfg(target_os = "macos")]
+mod permissions;
+
+#[cfg(target_os = "macos")]
 mod settings;
 
 #[cfg(target_os = "macos")]
@@ -41,6 +44,7 @@ mod mac {
         FocusDetection, detect_focus, ensure_trusted_with_prompt, frontmost_app_pid,
     };
     use crate::floating_overlay::FloatingOverlay;
+    use crate::permissions;
     use crate::settings::{self, Settings};
     use arc_swap::ArcSwap;
     use objc2::MainThreadMarker;
@@ -73,6 +77,8 @@ mod mac {
     const MENU_ID_EDIT_REPLACEMENTS: &str = "edit.replacements";
     /// D1「教一個更正」擷取 popover 觸發（docs/design/vocabulary-growth.md §3）。
     const MENU_ID_TEACH_CORRECTION: &str = "edit.teach_correction";
+    /// 「權限檢查…」：隨時重開首次啟動的權限引導（ADR-0008 / app.md §9.2）。
+    const MENU_ID_PERMISSIONS: &str = "permissions.check";
     /// 「最近注入英文 token」候選緩衝保留的句數（供更正 popover 的「聽成」下拉）。
     const RECENT_TOKENS_CAP: usize = 5;
     /// Whisper 餵的語言：強制 `zh` 中文 tokenizer，避免使用者反映的「偶爾出現韓文」
@@ -490,6 +496,8 @@ mod mac {
             .ok();
     }
 
+    // channels + 共享狀態的內部工作迴圈；參數多但各自語意清晰，struct 打包屬獨立清理（YAGNI）。
+    #[allow(clippy::too_many_arguments)]
     async fn worker_loop(
         mut hotkey_rx: UnboundedReceiver<HotkeyEvent>,
         mut audio_rx: UnboundedReceiver<AudioFrame>,
@@ -498,6 +506,8 @@ mod mac {
         proxy: EventLoopProxy<UserEvent>,
         user_settings: Arc<ArcSwap<Settings>>,
         edit_guard_frozen: Arc<std::sync::atomic::AtomicBool>,
+        // 輸入法 locale cache：main thread 取樣寫入，這裡只讀（ADR-0007）。
+        current_locale: Arc<ArcSwap<String>>,
     ) -> Result<(), RaflowError> {
         let backend = AppleSpeechBackend::new(LOCALE)?;
         let backend = match try_load_whisper() {
@@ -523,16 +533,15 @@ mod mac {
             eprintln!("raflow: Whisper 智慧校正 OFF（所見即所得）；可由 menu bar 開啟。");
         }
         // 每次錄音開始時決定 locale（ADR-0007 / spec/speech.md §2 / settings.md §4）：
-        // 「依輸入法自動切換」ON → 讀當前輸入法；OFF → 固定 zh-TW。
+        // 「依輸入法自動切換」ON → 用 main-thread 取樣的輸入法 locale cache；OFF → 固定 zh-TW。
+        // **不在此（worker thread）呼叫 TIS**——取樣由 hotkey 雙擊 handler 於主執行緒完成。
         let locale_settings = user_settings.clone();
+        let locale_cache = current_locale.clone();
         let mut app: App<AppleSpeechBackend> = App::with_locale_provider(
             backend,
             Box::new(move || {
-                if locale_settings.load().auto_locale {
-                    crate::input_source::current_input_locale()
-                } else {
-                    LOCALE.to_string()
-                }
+                let sampled = locale_cache.load();
+                resolve_locale(locale_settings.load().auto_locale, &sampled, LOCALE)
             }),
             LOCALE.to_string(), // fallback：preferred 語言 recognizer 不可用時退回 zh-TW
             transcript_tx,
@@ -587,6 +596,18 @@ mod mac {
         Ok(())
     }
 
+    /// 決定本次錄音的 speech locale：`auto_locale` ON → 用 main-thread 取樣的輸入法 locale
+    /// （`sampled`）；OFF → 固定 `fixed`（zh-TW）。抽成純函式以參數化測試（ADR-0007）。
+    fn resolve_locale(auto_locale: bool, sampled: &str, fixed: &str) -> String {
+        if auto_locale {
+            sampled.to_string()
+        } else {
+            fixed.to_string()
+        }
+    }
+
+    // 薄包裝：建立 current-thread runtime 後轉呼 worker_loop；參數同上，struct 打包屬獨立清理。
+    #[allow(clippy::too_many_arguments)]
     fn run_worker(
         hotkey_rx: UnboundedReceiver<HotkeyEvent>,
         audio_rx: UnboundedReceiver<AudioFrame>,
@@ -595,6 +616,9 @@ mod mac {
         proxy: EventLoopProxy<UserEvent>,
         user_settings: Arc<ArcSwap<Settings>>,
         edit_guard_frozen: Arc<std::sync::atomic::AtomicBool>,
+        // 輸入法 locale cache：由 hotkey 雙擊 handler 於**主執行緒**取樣寫入（ADR-0007），
+        // 這裡（worker thread）只讀，絕不呼叫 Carbon TIS（跨執行緒呼叫會 dispatch 斷言崩潰）。
+        current_locale: Arc<ArcSwap<String>>,
     ) -> Result<(), RaflowError> {
         let rt = build_current_thread_rt()?;
         rt.block_on(worker_loop(
@@ -605,6 +629,7 @@ mod mac {
             proxy,
             user_settings,
             edit_guard_frozen,
+            current_locale,
         ))
     }
 
@@ -652,6 +677,7 @@ mod mac {
         let edit_terms = MenuItem::with_id(MENU_ID_EDIT_TERMS, "編輯自訂詞彙…", true, None);
         let edit_replacements =
             MenuItem::with_id(MENU_ID_EDIT_REPLACEMENTS, "編輯取代規則…", true, None);
+        let permissions_item = MenuItem::with_id(MENU_ID_PERMISSIONS, "權限檢查…", true, None);
         let quit_item = MenuItem::with_id(QUIT_MENU_ID, "結束 raflow", true, None);
 
         menu.append(&version_item).map_err(menu_err)?;
@@ -666,6 +692,7 @@ mod mac {
         menu.append(&edit_replacements).map_err(menu_err)?;
         menu.append(&PredefinedMenuItem::separator())
             .map_err(menu_err)?;
+        menu.append(&permissions_item).map_err(menu_err)?;
         menu.append(&quit_item).map_err(menu_err)?;
 
         // Idle icon 走 template（黑白剪影，由 macOS 依 menu bar 明暗 tint）；
@@ -835,9 +862,16 @@ mod mac {
         eprintln!("raflow: requesting speech authorization...");
         {
             let rt = build_current_thread_rt()?;
-            rt.block_on(raflow_speech::request_authorization())?;
+            // 語音未授權**不再致命**：舊版在此 `?` 直接退出，導致最需要引導的「語音被拒」使用者
+            // 永遠看不到後面的權限引導視窗。改為記 log 後繼續啟動——app 仍常駐 menu bar，onboarding
+            // 會偵測到語音缺項並引導；授權後重啟即可用（recognizer 於下次啟動生效）。
+            match rt.block_on(raflow_speech::request_authorization()) {
+                Ok(()) => eprintln!("raflow: speech authorized."),
+                Err(err) => eprintln!(
+                    "raflow: ⚠ 語音辨識尚未授權（{err}）→ 繼續啟動，改由引導視窗提示授權。"
+                ),
+            }
         }
-        eprintln!("raflow: speech authorized.");
 
         let idle_icon = decode_icon(ICON_IDLE, "idle")?;
         let recording_icon = decode_icon(ICON_RECORDING, "recording")?;
@@ -865,6 +899,11 @@ mod mac {
         let user_settings: Arc<ArcSwap<Settings>> =
             Arc::new(ArcSwap::from_pointee(initial_settings));
 
+        // 輸入法 locale cache（ADR-0007）：Carbon TIS 只能在主執行緒呼叫，故由 hotkey 雙擊 handler
+        // 於主執行緒取樣寫入、worker 只讀。啟動時（此處即主執行緒）先取樣一次作初值。
+        let current_locale: Arc<ArcSwap<String>> =
+            Arc::new(ArcSwap::from_pointee(crate::input_source::current_input_locale()));
+
         let (hotkey_tx, hotkey_rx) = unbounded_channel::<HotkeyEvent>();
         let (audio_tx, audio_rx) = unbounded_channel::<AudioFrame>();
         let (transcript_tx, transcript_rx) = unbounded_channel::<TranscriptUpdate>();
@@ -887,6 +926,7 @@ mod mac {
         let proxy_for_worker = proxy.clone();
         let settings_for_worker = user_settings.clone();
         let frozen_for_worker = edit_guard_frozen.clone();
+        let locale_for_worker = current_locale.clone();
         thread::Builder::new()
             .name("raflow-worker".into())
             .spawn(move || {
@@ -898,33 +938,46 @@ mod mac {
                     proxy_for_worker,
                     settings_for_worker,
                     frozen_for_worker,
+                    locale_for_worker,
                 ) {
                     report_error("worker exited with error", &err);
                 }
             })
             .map_err(|e| spawn_error(format!("spawn worker thread: {e}")))?;
 
-        let _hotkey_handle = raflow_hotkey::register(hotkey_tx)?;
-        // 主動觸發系統 Accessibility prompt（若未授權）。enigo 的 CGEventPost 在沒
-        // Accessibility 時「靜默 no-op」不回錯誤，使用者會完全看不出問題。
-        // `AXIsProcessTrustedWithOptions(prompt: true)` 一個 process 生命週期只跳一次。
-        if !ensure_trusted_with_prompt() {
+        // Hotkey 雙擊 handler 於**主執行緒**執行 → 在此取樣輸入法 locale 寫入 cache（ADR-0007）。
+        // 只有 auto_locale ON 才需要（省下 TIS 呼叫）；worker 端只讀 cache、絕不碰 TIS。
+        let locale_for_sampler = current_locale.clone();
+        let settings_for_sampler = user_settings.clone();
+        let _hotkey_handle = raflow_hotkey::register(hotkey_tx, move || {
+            if settings_for_sampler.load().auto_locale {
+                locale_for_sampler.store(Arc::new(crate::input_source::current_input_locale()));
+            }
+        })?;
+
+        // 首次啟動權限引導（ADR-0008 / app.md §9.2）：主動請求三道權限，缺項則彈**看得見**的
+        // 原生引導視窗（取代舊版只有 stderr、Finder 啟動看不到的提示）。
+        //   - Accessibility：`AXIsProcessTrustedWithOptions(prompt: true)`，一個 process 只跳一次。
+        //     enigo 的 CGEventPost 沒此權限時「靜默 no-op」不回錯誤，故必須主動引導。
+        //   - Microphone：`NotDetermined` 時主動跳 prompt，避免首次錄音才被 cpal 惰性觸發、
+        //     且被拒還靜默錄靜音（多位使用者回報的「有錄音卻沒字」盲區）。
+        let _ = ensure_trusted_with_prompt();
+        if !permissions::microphone_granted() {
+            let rt = build_current_thread_rt()?;
+            let granted = rt.block_on(permissions::request_microphone());
+            eprintln!("raflow: 麥克風授權請求結果 = {granted}");
+        }
+        // 缺項的引導 NSAlert 延到 event loop 的 `StartCause::Init`（tray 建好、app 完成 launch）
+        // 才彈——app-owned modal 在 `applicationDidFinishLaunching` 前 runModal 可能無法置前。
+        let startup_missing = permissions::capture_snapshot().missing();
+        if startup_missing.is_empty() {
+            eprintln!("raflow: 權限檢查通過（麥克風 / 語音辨識 / 輔助使用皆已授權）。");
+        } else {
             eprintln!(
-                "raflow: ⚠ Accessibility 權限未授予 → enigo 的文字注入會靜默失敗，輸入框\n  \
-                 不會出現文字。剛剛應該已彈出系統 dialog，請點「開啟系統設定」並把\n  \
-                 raflow 加入「隱私權與安全性 → 輔助使用」並打勾。打勾後重啟 raflow 生效。\n  \
-                 （focus 偵測也會一併失敗 → floating panel 不顯示）",
+                "raflow: ⚠ 尚缺權限 {startup_missing:?} → 啟動後顯示引導視窗（可於 menu「權限檢查…」重開）。"
             );
         }
         eprintln!("raflow: ready. double-tap Cmd to toggle recording. Quit from menu bar icon.");
-        // 給使用者明顯的故障排除線索：menu bar 圖示變紅 = hotkey OK；如果輸入框沒出現
-        // 文字，多半是 enigo 沒拿到 Accessibility 權限（macOS 上 enigo.text() 在沒
-        // 授權時會「靜默 no-op」不回錯誤，所以 stderr 看不到任何 `!` 警告）。
-        eprintln!(
-            "raflow: 若雙擊 Cmd 後 menu bar 變紅但輸入框沒出現文字 → 通常是 Accessibility 權限\n  \
-             → 系統設定 → 隱私權與安全性 → 輔助使用 → 加入 raflow.app 並打勾\n  \
-             → 或執行：tccutil reset Accessibility dev.raflow.raflow 後重新授權",
-        );
 
         // tray-icon 官方 doc 要求：「the earliest safe point is the StartCause::Init event」。
         // 在這之前 build 會讓 NSStatusItem 無法註冊到 NSStatusBar，icon 根本不會出現。
@@ -948,6 +1001,9 @@ mod mac {
         let mut activity_monitor: Option<raflow_hotkey::ActivityMonitorHandle> = None;
         // 目前是否錄音中：用來忽略「錄音已停但 channel 殘留的 EditGuardFrozen」避免 idle 時誤切圖示。
         let mut is_recording = false;
+        // 待彈的權限引導：於 `StartCause::Init`（tray 建好後）take 一次顯示。
+        let mut pending_onboarding: Option<Vec<permissions::Permission>> =
+            (!startup_missing.is_empty()).then_some(startup_missing);
 
         event_loop.run(move |event, _target, control_flow| {
             // 預設 wait；若有 pending hide 則 wait 到指定時間醒來收尾
@@ -968,6 +1024,10 @@ mod mac {
                     match FloatingOverlay::new() {
                         Ok(o) => overlay = Some(o),
                         Err(err) => report_error("! floating overlay disabled", &err),
+                    }
+                    // 首次啟動缺權限 → 彈可見的原生引導（app 已完成 launch，modal 可正確置前）。
+                    if let Some(missing) = pending_onboarding.take() {
+                        permissions::show_onboarding(&missing);
                     }
                 }
                 Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
@@ -1120,6 +1180,14 @@ mod mac {
                         } else if id == MENU_ID_TEACH_CORRECTION {
                             // 成功靜默（對話框關掉＝完成）；出錯由 teach_correction 內部彈原生提示。
                             teach_correction(&recent_tokens);
+                        } else if id == MENU_ID_PERMISSIONS {
+                            // 隨時重開權限引導：全綠給確認提示，否則列出剩餘缺項並可直達設定。
+                            let missing = permissions::capture_snapshot().missing();
+                            if missing.is_empty() {
+                                permissions::show_all_granted();
+                            } else {
+                                permissions::show_onboarding(&missing);
+                            }
                         }
                     }
                 },
@@ -1131,6 +1199,24 @@ mod mac {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn resolve_locale_picks_sampled_only_when_auto() {
+            // (auto_locale, sampled, fixed) → 期望：ON 用 sampled、OFF 用 fixed。
+            let cases = [
+                (true, "en-US", "zh-TW", "en-US"),
+                (true, "zh-TW", "zh-TW", "zh-TW"),
+                (false, "en-US", "zh-TW", "zh-TW"), // 關閉自動 → 忽略 sampled
+                (false, "ja-JP", "zh-TW", "zh-TW"),
+            ];
+            for (auto, sampled, fixed, want) in cases {
+                assert_eq!(
+                    resolve_locale(auto, sampled, fixed),
+                    want,
+                    "auto={auto} sampled={sampled}"
+                );
+            }
+        }
 
         #[test]
         fn permission_hint_covers_all_actionable_errors() {

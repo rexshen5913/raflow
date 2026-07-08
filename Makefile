@@ -1,4 +1,4 @@
-.PHONY: test test-integration check fmt lint icons dev-cert bundle bundle-whisper run run-bundle install-app install-app-whisper whisper-model-small whisper-model-turbo whisper-vad-model vad-harness tts-fixtures rolling-harness clean
+.PHONY: test test-integration check fmt lint icons dev-cert bundle bundle-whisper run run-bundle install-app install-app-whisper whisper-model-small whisper-model-turbo whisper-vad-model vad-harness tts-fixtures rolling-harness bench clean
 
 BUNDLE_DIR := target/release/raflow.app
 BUNDLE_BIN := $(BUNDLE_DIR)/Contents/MacOS/raflow
@@ -213,6 +213,13 @@ tts-fixtures:
 # 需先 make whisper-model-turbo whisper-vad-model tts-fixtures。
 rolling-harness:
 	cargo run -p raflow-speech --example rolling_harness --features whisper --release
+
+# Whisper 效能/準確度 benchmark：量測轉錄延遲、即時率 RTF、CER（對已知逐字稿）。
+# 需先 make whisper-model-turbo tts-fixtures。
+# 用法：make bench                          （resolve_model_path 選到的模型）
+#       make bench MODELS=a.bin,b.bin        （比較多個模型：turbo vs small）
+bench:
+	RAFLOW_BENCH_MODELS="$(MODELS)" cargo run -p raflow-speech --example bench_harness --features whisper --release
 
 clean:
 	cargo clean

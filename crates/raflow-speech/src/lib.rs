@@ -19,4 +19,4 @@ pub use whisper_backend::{
 };
 
 #[cfg(target_os = "macos")]
-pub use apple_backend::{AppleSpeechBackend, request_authorization};
+pub use apple_backend::{AppleSpeechBackend, authorization_granted, request_authorization};

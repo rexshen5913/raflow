@@ -32,7 +32,15 @@ arc-swap.workspace = true
 tao.workspace = true
 tray-icon.workspace = true
 image.workspace = true
+block2 = { workspace = true }
 objc2 = { workspace = true }
+# 麥克風授權查詢/請求（AVCaptureDevice），供首次啟動權限引導。見 ADR-0008。
+objc2-av-foundation = { workspace = true, features = [
+    "AVCaptureDevice",
+    "AVMediaFormat",
+    # requestAccessForMediaType_completionHandler 需 block2 completion handler。
+    "block2",
+] }
 objc2-app-kit = { workspace = true, features = [
     "NSApplication",
     "NSResponder",
@@ -44,6 +52,9 @@ objc2-app-kit = { workspace = true, features = [
     "NSControl",
     "NSColor",
     "NSScreen",
+    # NSEvent::mouseLocation（modal 置中到游標所在螢幕，correction_popover.rs）。明確啟用，
+    # 不依賴 NSResponder/NSApplication 的傳遞性帶入。
+    "NSEvent",
     "NSGraphics",
     "NSAttributedString",
     "NSFont",

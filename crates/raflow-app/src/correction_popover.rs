@@ -15,10 +15,54 @@ use objc2::runtime::Sel;
 use objc2::{MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSButton,
-    NSButtonType, NSComboBox, NSControlStateValueOn, NSMenu, NSMenuItem, NSModalResponse,
-    NSTextField, NSView,
+    NSButtonType, NSComboBox, NSControlStateValueOn, NSEvent, NSFloatingWindowLevel, NSMenu,
+    NSMenuItem, NSModalResponse, NSScreen, NSTextField, NSView, NSWindowCollectionBehavior,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSPointInRect, NSRect, NSSize, NSString};
+
+/// 在使用者**目前所在的螢幕/Space** 置中顯示 NSAlert 並跑 modal，回傳 response。
+///
+/// LSUIElement（menu bar 背景程式）的 modal 若不特別處理會有三個問題：
+///   (a) 切 `.regular` 前景後只冒出 Dock 圖示、視窗躲在後面 → 要手點 Dock 才浮上來；
+///   (b) 出現在 app 上次所在的 Space，而非使用者目前的 Space；
+///   (c) 雙螢幕時 NSAlert 預設在**主螢幕**置中，而非使用者正在操作的那個螢幕。
+///
+/// 對策：`MoveToActiveSpace` + floating level + `orderFrontRegardless` 解 (a)(b)；把視窗重新
+/// 置中到「滑鼠游標所在螢幕」解 (c)。並改用 `runModalForWindow`（而非 `alert.runModal()`）——
+/// 後者每次會把面板重新置中回主螢幕、蓋掉我們的定位；前者尊重我們設好的 frame。按鈕回傳碼相同
+/// （NSAlert 按鈕觸發 `stopModalWithCode:` → `NSAlertFirstButtonReturn` 等）。
+///
+/// 呼叫端仍需自行暫升 `.regular` + activate（見各 caller）。所有 raflow 的 modal 都應走此函式。
+pub fn run_alert_on_active_screen(alert: &NSAlert, mtm: MainThreadMarker) -> NSModalResponse {
+    // 先 layout 讓視窗尺寸定案，才能正確算置中原點。
+    alert.layout();
+    let win = alert.window();
+    win.setCollectionBehavior(NSWindowCollectionBehavior::MoveToActiveSpace);
+    win.setLevel(NSFloatingWindowLevel);
+
+    // 置中到滑鼠游標所在的螢幕（雙螢幕：你在哪個螢幕操作，就在哪個螢幕跳）。找不到就退回預設位置。
+    let cursor = NSEvent::mouseLocation();
+    for screen in NSScreen::screens(mtm).iter() {
+        if NSPointInRect(cursor, screen.frame()) {
+            let vf = screen.visibleFrame();
+            let wf = win.frame();
+            let origin = NSPoint::new(
+                vf.origin.x + (vf.size.width - wf.size.width) / 2.0,
+                vf.origin.y + (vf.size.height - wf.size.height) / 2.0,
+            );
+            win.setFrameOrigin(origin);
+            break;
+        }
+    }
+
+    win.makeKeyAndOrderFront(None);
+    win.orderFrontRegardless();
+    let response = NSApplication::sharedApplication(mtm).runModalForWindow(&win);
+    // `alert.runModal()` 結束時會自動把視窗 order out；手動 `runModalForWindow` 不會，
+    // 故按鈕點完 modal 已結束、視窗卻仍留在畫面 → 手動隱藏。
+    win.orderOut(None);
+    response
+}
 
 /// 擷取結果：使用者按「記住」後填的內容。
 pub struct CorrectionInput {
@@ -118,7 +162,7 @@ pub fn prompt_correction(candidates: &[String]) -> Option<CorrectionInput> {
     let prev_menu = app.mainMenu();
     app.setMainMenu(Some(&build_edit_main_menu(mtm)));
 
-    let response: NSModalResponse = alert.runModal();
+    let response: NSModalResponse = run_alert_on_active_screen(&alert, mtm);
 
     app.setMainMenu(prev_menu.as_deref());
     app.setActivationPolicy(prev_policy);
@@ -152,7 +196,7 @@ pub fn show_notice(title: &str, body: &str) {
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
-    let _ = alert.runModal();
+    let _ = run_alert_on_active_screen(&alert, mtm);
     app.setActivationPolicy(prev_policy);
 }
 

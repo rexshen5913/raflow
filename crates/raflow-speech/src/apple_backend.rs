@@ -391,6 +391,15 @@ pub async fn request_authorization() -> Result<(), RaflowError> {
     }
 }
 
+/// 目前是否已取得語音辨識授權（`Authorized`）。供首次啟動的權限引導（onboarding）廉價查詢——
+/// 與 `request_authorization` 不同，**不觸發任何 prompt**，可任意執行緒同步呼叫。
+/// 未定 / 被拒 / 受限一律回 `false`（引導視 false 為「待授權」）。
+pub fn authorization_granted() -> bool {
+    // SAFETY: SFSpeechRecognizer::authorizationStatus 為 Apple 靜態方法，無前置條件，任意執行緒可呼叫。
+    let status = unsafe { SFSpeechRecognizer::authorizationStatus() };
+    status == SFSpeechRecognizerAuthorizationStatus::Authorized
+}
+
 /// 生產環境的 Speech 後端：持有 `SFSpeechRecognizer`，每次 `start` 建立一個新的 request/task。
 ///
 /// 內部維護 `pcm_buffer`：累積本次 session 的原始 16 kHz mono i16 PCM，供 Phase 5
