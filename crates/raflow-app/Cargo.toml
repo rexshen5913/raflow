@@ -60,6 +60,8 @@ objc2-app-kit = { workspace = true, features = [
     "NSFont",
     "NSFontDescriptor",
     "NSParagraphStyle",
+    # 診斷讀表（permissions.rs）：三欄原生對齊，取代等寬字型 + 空白補齊
+    "NSGridView",
     # D1 更正擷取 popover（correction_popover.rs，ADR-0005）
     "NSAlert",
     "NSComboBox",
@@ -72,6 +74,9 @@ objc2-foundation = { workspace = true, features = [
     "NSThread",
     "NSGeometry",
     "NSString",
+    # 診斷讀表（permissions.rs）：NSGridView 的 rows 以 NSArray<NSView> 傳入。顯式宣告，
+    # 不倚賴 objc2-app-kit "NSGridView" feature 的傳遞性帶入。
+    "NSArray",
     "NSAttributedString",
     "NSDictionary",
     "NSEnumerator",

@@ -10,17 +10,19 @@
 //! 分層（憲法 §1.3 / §2）：
 //!   - 純邏輯（`Permission` / `PermissionSnapshot` / `onboarding_body`）：safe，參數化 unit test。
 //!   - FFI 查詢（`microphone_granted` / `request_microphone`）：AVFoundation，unsafe 集中（ADR-0008）。
-//!   - NSAlert 引導（`show_onboarding` / `show_all_granted`）：objc2-app-kit 既有 safe API（無 unsafe）。
+//!   - NSAlert 引導 / 診斷（`show_onboarding` / `show_diagnostics`）：objc2-app-kit 既有 safe API（無 unsafe）。
 //!
 //! 模組入口（`main.rs`）已用 `#[cfg(target_os = "macos")]` 限定，這裡不再重複。
 
+use std::path::PathBuf;
 use std::process::Command;
 
 /// raflow 首次啟動需即時查詢並引導的三道權限（`app.md §9.2`）。`ALL` 的順序即引導顯示順序。
 ///
-/// Input Monitoring（雙擊 Cmd 偵測）**不**在此查詢：其失效＝雙擊完全沒反應，本身即顯而易見，
-/// 與 silent-mic 陷阱不同；即時查詢需另一組 IOKit/CoreGraphics FFI 與另一個 ADR（見 ADR-0008
-/// §1 範圍界定），依 YAGNI 只在引導文末以文字提示。
+/// Input Monitoring（雙擊 Cmd 偵測）**不**在此查詢：raflow 的雙擊偵測與文字注入都走**輔助使用**
+/// （NSEvent 全域監看 + enigo 皆以 Accessibility 為 gate），而 macOS 對已授權輔助使用的 app 會讓
+/// 其涵蓋 listen-event 存取（`IOHIDCheckAccess` 回 Granted），raflow 從不獨立出現在 Input Monitoring
+/// 清單。故單獨查詢它對 raflow 無診斷價值（永遠跟著輔助使用走），只在引導文末以文字提示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
     Microphone,
@@ -104,7 +106,7 @@ pub fn onboarding_body(missing: &[Permission]) -> Option<String> {
     }
     body.push_str(
         "\n\n點「開啟系統設定」會直接跳到第一項的設定頁；在清單裡把 raflow 打勾即可。\n\
-         改完可從 menu bar 圖示 →「權限檢查…」再次確認剩下幾項。",
+         改完可從 menu bar 圖示 →「診斷…」再次確認剩下幾項。",
     );
     // 輔助使用特別：enigo 在啟動時就快取了授權狀態，執行中才授權**不會生效**，必須重啟 raflow。
     // 這是 macOS 對 Accessibility 的行為，其他權限不受影響。
@@ -115,8 +117,8 @@ pub fn onboarding_body(missing: &[Permission]) -> Option<String> {
         );
     }
     body.push_str(
-        "\n\n（若雙擊 Cmd 完全沒反應，是「輸入監控 Input Monitoring」未授權，同樣在\
-         「隱私權與安全性」裡開啟。）",
+        "\n\n（若雙擊 Cmd 完全沒反應，同樣是「輔助使用」未授權——raflow 的雙擊偵測以它為準，\
+         不需另外開「輸入監控」。）",
     );
     Some(body)
 }
@@ -131,6 +133,146 @@ pub fn capture_snapshot() -> PermissionSnapshot {
         speech_recognition: raflow_speech::authorization_granted(),
         accessibility: crate::accessibility::is_trusted(),
     }
+}
+
+// ── 診斷讀表（menu「診斷…」：每項即時狀態）──────────────────────────────────────────
+//
+// 只涵蓋 raflow 實際使用的資源：三道權限（麥克風／語音辨識／輔助使用）+ Whisper／VAD 模型檔。
+// **不含 Input Monitoring**：raflow 的雙擊偵測與注入都走輔助使用，輸入監控被其涵蓋、對 raflow
+// 無獨立診斷價值（詳見 `Permission` 上方註解）。
+
+/// 診斷讀表單列的嚴重度，決定顯示圖示。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagLevel {
+    /// 已就緒（✅）。
+    Ok,
+    /// 有問題、影響功能（⚠️）。
+    Warn,
+}
+
+impl DiagLevel {
+    /// 讀表前綴圖示。
+    pub fn icon(self) -> &'static str {
+        match self {
+            DiagLevel::Ok => "✅",
+            DiagLevel::Warn => "⚠️",
+        }
+    }
+}
+
+/// 診斷讀表的一列：標籤 + 嚴重度 + 一句話狀態／後果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagRow {
+    pub label: &'static str,
+    pub level: DiagLevel,
+    pub detail: String,
+}
+
+/// 建構診斷讀表所需的即時輸入。抽成 struct 讓 [`build_diagnostic`] 成為可參數化測試的純函式
+/// （檔案系統查詢集中在 [`collect_diag_inputs`]）。
+#[derive(Debug, Clone, Copy)]
+pub struct DiagInputs {
+    pub microphone: bool,
+    pub speech_recognition: bool,
+    pub accessibility: bool,
+    /// 輔助使用已授權、但 enigo 已快取啟動時的未授權狀態 → 需重啟才生效（見 `onboarding_body`）。
+    /// 由 `main.rs`（唯一知道 `launched_ax_trusted` 的地方）注入。
+    pub accessibility_needs_restart: bool,
+    pub whisper_model_ready: bool,
+    pub vad_model_ready: bool,
+}
+
+/// 純函式：即時輸入 → 五列診斷讀表。順序固定：麥克風 → 語音辨識 → 輔助使用 →
+/// Whisper 模型 → VAD 模型。抽出以便 TDD（憲法 §2）。
+pub fn build_diagnostic(inputs: &DiagInputs) -> Vec<DiagRow> {
+    let row = |label, level, detail: &str| DiagRow {
+        label,
+        level,
+        detail: detail.to_string(),
+    };
+    let ok_or_warn = |granted, label, ok: &str, warn: &str| {
+        if granted {
+            row(label, DiagLevel::Ok, ok)
+        } else {
+            row(label, DiagLevel::Warn, warn)
+        }
+    };
+
+    // 輔助使用三態：未授權 / 已授權待重啟 / 已授權就緒。
+    let accessibility = if !inputs.accessibility {
+        row("輔助使用", DiagLevel::Warn, "未授權——只能手動 Cmd+V 貼上")
+    } else if inputs.accessibility_needs_restart {
+        row(
+            "輔助使用",
+            DiagLevel::Warn,
+            "已授權，但需重新啟動 raflow 才生效（menu →「重新啟動 raflow」）",
+        )
+    } else {
+        row("輔助使用", DiagLevel::Ok, "已授權")
+    };
+
+    vec![
+        ok_or_warn(
+            inputs.microphone,
+            "麥克風",
+            "已授權",
+            "未授權——說話錄到靜音、完全沒有字",
+        ),
+        ok_or_warn(
+            inputs.speech_recognition,
+            "語音辨識",
+            "已授權",
+            "未授權——無法把語音轉成文字",
+        ),
+        accessibility,
+        ok_or_warn(
+            inputs.whisper_model_ready,
+            "Whisper 模型",
+            "已就緒",
+            "缺檔——終校停用，回退 Apple 即時輸出",
+        ),
+        ok_or_warn(
+            inputs.vad_model_ready,
+            "VAD 模型",
+            "已就緒",
+            "缺檔——退化為整段校正（非句級滾動）",
+        ),
+    ]
+}
+
+/// 純函式：讀表中「可由開啟系統設定解決」的**第一個**權限缺項的設定深連結。
+/// 只涵蓋三道權限（模型缺檔開設定沒用，需重新下載，不列入）；全部就緒 → `None`（無需設定按鈕）。
+/// 順序與讀表一致：麥克風 → 語音辨識 → 輔助使用。
+pub fn first_actionable_settings_url(inputs: &DiagInputs) -> Option<&'static str> {
+    if !inputs.microphone {
+        Some(Permission::Microphone.settings_url())
+    } else if !inputs.speech_recognition {
+        Some(Permission::SpeechRecognition.settings_url())
+    } else if !inputs.accessibility {
+        Some(Permission::Accessibility.settings_url())
+    } else {
+        None
+    }
+}
+
+/// 即時蒐集診斷輸入：三道權限快照 + Whisper／VAD 模型檔存在與否。
+/// `accessibility_needs_restart` 由 caller（`main.rs`）注入，這裡無從得知 `launched_ax_trusted`。
+pub fn collect_diag_inputs(accessibility_needs_restart: bool) -> DiagInputs {
+    let snap = capture_snapshot();
+    DiagInputs {
+        microphone: snap.microphone,
+        speech_recognition: snap.speech_recognition,
+        accessibility: snap.accessibility,
+        accessibility_needs_restart: snap.accessibility && accessibility_needs_restart,
+        whisper_model_ready: model_file_ready(raflow_speech::resolve_model_path()),
+        vad_model_ready: model_file_ready(raflow_speech::resolve_vad_model_path()),
+    }
+}
+
+/// 模型路徑指向**實體檔案** → 就緒。路徑解析失敗（`None`）、不存在、或指向目錄 → 未就緒。
+/// 用 `is_file()`（非 `exists()`）避免把同名目錄誤判為模型就緒。
+fn model_file_ready(path: Option<PathBuf>) -> bool {
+    path.as_deref().is_some_and(|p| p.is_file())
 }
 
 // ── 麥克風授權 FFI（AVFoundation，ADR-0008）─────────────────────────────────────
@@ -191,7 +333,7 @@ pub async fn request_microphone() -> bool {
 // ── 引導對話框（NSAlert，objc2-app-kit safe API，無 unsafe）──────────────────────
 
 /// 顯示首次啟動 / menu 觸發的權限引導。列出所有缺項與其用途；主按鈕「開啟系統設定」直達**第一個**
-/// 缺項的設定頁（其餘缺項於改完後由「權限檢查…」再逐一導引）。`missing` 為空時不彈窗。
+/// 缺項的設定頁（其餘缺項於改完後由「診斷…」再逐一導引）。`missing` 為空時不彈窗。
 ///
 /// 只能在主執行緒呼叫（`MainThreadMarker` 強制，非主執行緒安靜跳過）。
 pub fn show_onboarding(missing: &[Permission]) {
@@ -233,12 +375,92 @@ pub fn show_onboarding(missing: &[Permission]) {
     }
 }
 
-/// menu「權限檢查…」在三道權限全綠時給的確認提示。
-pub fn show_all_granted() {
-    crate::correction_popover::show_notice(
-        "權限都已就緒",
-        "麥克風、語音辨識、輔助使用都已授權，raflow 可以正常聽寫。",
-    );
+/// menu「診斷…」的診斷讀表：列出五項（麥克風／語音辨識／輔助使用／Whisper 模型／VAD 模型）的
+/// 即時狀態。有可由系統設定解決的權限缺項時，主按鈕「開啟系統設定」直達**第一個**缺項；
+/// 否則單一「好」按鈕。`accessibility_needs_restart` 由 caller 注入（見 [`collect_diag_inputs`]）。
+///
+/// 只能在主執行緒呼叫（`MainThreadMarker` 強制，非主執行緒安靜跳過）。
+pub fn show_diagnostics(accessibility_needs_restart: bool) {
+    use objc2::MainThreadMarker;
+    use objc2::rc::Retained;
+    use objc2_app_kit::{
+        NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSColor,
+        NSFont, NSGridCellPlacement, NSGridView, NSTextField, NSView,
+    };
+    use objc2_foundation::{NSArray, NSString};
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let inputs = collect_diag_inputs(accessibility_needs_restart);
+    let rows = build_diagnostic(&inputs);
+    let settings_url = first_actionable_settings_url(&inputs);
+
+    // 三欄讀表用 **NSGridView** 排版：圖示 / 項目 / 狀態說明，各欄由 AppKit 原生對齊。
+    // 不再靠等寬字型 + 空白補齊——`monospacedSystemFont` 只保證 ASCII 等寬，CJK 走 fallback
+    // 字型、advance 非 ASCII 兩倍，補齊必歪（實機打臉，見 implement.md §18.10）。
+    let font = NSFont::systemFontOfSize(13.0);
+    let warn_color = NSColor::systemRedColor();
+    let detail_color = NSColor::secondaryLabelColor();
+    let make_cell = |text: &str, color: &NSColor| -> Retained<NSView> {
+        let tf = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+        tf.setFont(Some(&font));
+        tf.setTextColor(Some(color));
+        // NSTextField → NSControl → NSView，放進 NSArray<NSView>。
+        Retained::into_super(Retained::into_super(tf))
+    };
+    let label_color = NSColor::labelColor();
+    let grid_rows: Vec<Retained<NSArray<NSView>>> = rows
+        .iter()
+        .map(|r| {
+            let detail_c = if r.level == DiagLevel::Warn {
+                &*warn_color
+            } else {
+                &*detail_color
+            };
+            let cells = [
+                make_cell(r.level.icon(), &label_color),
+                make_cell(r.label, &label_color),
+                make_cell(&r.detail, detail_c),
+            ];
+            NSArray::from_retained_slice(&cells)
+        })
+        .collect();
+    let grid = NSGridView::gridViewWithViews(&NSArray::from_retained_slice(&grid_rows), mtm);
+    grid.setColumnSpacing(10.0);
+    grid.setRowSpacing(7.0);
+    grid.columnAtIndex(0).setXPlacement(NSGridCellPlacement::Center); // 圖示置中
+    grid.columnAtIndex(1).setXPlacement(NSGridCellPlacement::Leading); // 項目靠左
+    grid.columnAtIndex(2).setXPlacement(NSGridCellPlacement::Leading); // 狀態靠左
+    // 依內容自動求最適尺寸（NSResponder + NSView 已啟用 → fittingSize 可用）。
+    let size = grid.fittingSize();
+    grid.setFrameSize(size);
+
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("raflow 診斷"));
+    alert.setInformativeText(&NSString::from_str("各項即時狀態："));
+    alert.setAccessoryView(Some(&grid));
+    if settings_url.is_some() {
+        alert.addButtonWithTitle(&NSString::from_str("開啟系統設定"));
+        alert.addButtonWithTitle(&NSString::from_str("關閉"));
+    } else {
+        alert.addButtonWithTitle(&NSString::from_str("好"));
+    }
+
+    // 暫升 `.regular` 前景讓 LSUIElement 背景程式的對話框可見可聚焦，結束還原（同 show_onboarding）。
+    let app = NSApplication::sharedApplication(mtm);
+    let prev_policy = app.activationPolicy();
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    let response = crate::correction_popover::run_alert_on_active_screen(&alert, mtm);
+    app.setActivationPolicy(prev_policy);
+
+    if let Some(url) = settings_url {
+        if response == NSAlertFirstButtonReturn {
+            open_settings(url);
+        }
+    }
 }
 
 /// 「輔助使用剛授權、但 enigo 已快取啟動時的未授權狀態」時的重啟提議。回傳使用者是否選擇立即重啟。
@@ -358,10 +580,82 @@ mod tests {
         assert!(body.contains("輔助使用"));
         assert!(body.contains(Permission::Accessibility.symptom()));
         assert!(!body.contains("語音辨識"));
-        // 編號從 1 起、含 Input Monitoring 的文字提示。
+        // 編號從 1 起。
         assert!(body.contains("1."));
         assert!(body.contains("2."));
-        assert!(body.contains("Input Monitoring"));
+        // 「雙擊沒反應」的提示應導向輔助使用，不再提 Input Monitoring（實機驗證雙擊 gate 是輔助使用）。
+        assert!(body.contains("雙擊 Cmd"));
+        assert!(!body.contains("Input Monitoring"));
+    }
+
+    fn diag(mic: bool, speech: bool, ax: bool, ax_restart: bool, whisper: bool, vad: bool) -> DiagInputs {
+        DiagInputs {
+            microphone: mic,
+            speech_recognition: speech,
+            accessibility: ax,
+            accessibility_needs_restart: ax_restart,
+            whisper_model_ready: whisper,
+            vad_model_ready: vad,
+        }
+    }
+
+    #[test]
+    fn build_diagnostic_has_five_rows_in_fixed_order() {
+        let rows = build_diagnostic(&diag(true, true, true, false, true, true));
+        let labels: Vec<&str> = rows.iter().map(|r| r.label).collect();
+        assert_eq!(
+            labels,
+            vec!["麥克風", "語音辨識", "輔助使用", "Whisper 模型", "VAD 模型"]
+        );
+        // 全就緒 → 每列都是 Ok。
+        assert!(rows.iter().all(|r| r.level == DiagLevel::Ok));
+    }
+
+    #[test]
+    fn build_diagnostic_levels_reflect_state() {
+        // 全缺（權限缺、模型缺）→ 每列 Warn。
+        let rows = build_diagnostic(&diag(false, false, false, false, false, false));
+        assert!(rows.iter().all(|r| r.level == DiagLevel::Warn));
+        // 麥克風缺項要帶症狀文字。
+        assert!(rows[0].detail.contains("靜音"));
+    }
+
+    #[test]
+    fn accessibility_needs_restart_shows_warn_with_restart_hint() {
+        // 已授權但待重啟 → Warn + 重啟提示。
+        let rows = build_diagnostic(&diag(true, true, true, true, true, true));
+        let ax = rows.iter().find(|r| r.label == "輔助使用").expect("有輔助使用列");
+        assert_eq!(ax.level, DiagLevel::Warn);
+        assert!(ax.detail.contains("重新啟動"));
+        // 未授權（needs_restart 無意義）→ Warn 但不是重啟提示、而是「只能手動」。
+        let rows2 = build_diagnostic(&diag(true, true, false, false, true, true));
+        let ax2 = rows2.iter().find(|r| r.label == "輔助使用").expect("有輔助使用列");
+        assert_eq!(ax2.level, DiagLevel::Warn);
+        assert!(ax2.detail.contains("Cmd+V"));
+    }
+
+    #[test]
+    fn first_actionable_settings_url_follows_priority_and_skips_models() {
+        // 全綠 → None（不需要設定按鈕）。
+        assert_eq!(
+            first_actionable_settings_url(&diag(true, true, true, false, true, true)),
+            None
+        );
+        // 只有模型缺 → 仍 None（開設定沒用，需重新下載）。
+        assert_eq!(
+            first_actionable_settings_url(&diag(true, true, true, false, false, false)),
+            None
+        );
+        // 麥克風優先於後面的缺項。
+        assert_eq!(
+            first_actionable_settings_url(&diag(false, false, false, false, true, true)),
+            Some(Permission::Microphone.settings_url())
+        );
+        // 只有輔助使用缺 → 指向輔助使用深連結。
+        assert_eq!(
+            first_actionable_settings_url(&diag(true, true, false, false, true, true)),
+            Some(Permission::Accessibility.settings_url())
+        );
     }
 
     #[test]

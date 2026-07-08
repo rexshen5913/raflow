@@ -26,8 +26,6 @@
 	<string>13.0</string>
 	<key>LSUIElement</key>
 	<true/>
-	<key>NSInputMonitoringUsageDescription</key>
-	<string>raflow 需要監看鍵盤事件，才能偵測您雙擊 Cmd 觸發語音輸入。</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>raflow 需要麥克風，才能擷取您的語音以供辨識。</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

@@ -115,7 +115,7 @@ pub fn register<F: Fn() + 'static>(
     let token = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &handler);
 
     let monitor = token.ok_or_else(|| RaflowError::HotkeyRegister {
-        detail: "addGlobalMonitorForEventsMatchingMask_handler returned nil (Input Monitoring 權限可能未授予)".into(),
+        detail: "addGlobalMonitorForEventsMatchingMask_handler returned nil (輔助使用權限可能未授予)".into(),
     })?;
 
     Ok(HotkeyHandle {
@@ -184,7 +184,7 @@ pub fn register_activity_monitor(
 
     let token = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &handler);
     let monitor = token.ok_or_else(|| RaflowError::HotkeyRegister {
-        detail: "activity monitor addGlobalMonitorForEvents returned nil (Input Monitoring 權限可能未授予)".into(),
+        detail: "activity monitor addGlobalMonitorForEvents returned nil (輔助使用權限可能未授予)".into(),
     })?;
 
     Ok(ActivityMonitorHandle {

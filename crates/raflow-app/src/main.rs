@@ -77,7 +77,7 @@ mod mac {
     const MENU_ID_EDIT_REPLACEMENTS: &str = "edit.replacements";
     /// D1「教一個更正」擷取 popover 觸發（docs/design/vocabulary-growth.md §3）。
     const MENU_ID_TEACH_CORRECTION: &str = "edit.teach_correction";
-    /// 「權限檢查…」：隨時重開首次啟動的權限引導（ADR-0008 / app.md §9.2）。
+    /// 「診斷…」：隨時查五項（三權限 + Whisper/VAD 模型）即時狀態（ADR-0008 / app.md §9.2）。
     const MENU_ID_PERMISSIONS: &str = "permissions.check";
     /// 「重新啟動 raflow」：授權輔助使用後需重啟才生效（enigo 快取，v0.1.7）。
     const MENU_ID_RESTART: &str = "app.restart";
@@ -132,8 +132,9 @@ mod mac {
                  open 'x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility'",
             ),
             RaflowError::HotkeyRegister { .. } => Some(
-                "→ 雙擊 Cmd 偵測註冊失敗。多半是 Input Monitoring 權限未授予：\n  \
-                 open 'x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ListenEvent'",
+                "→ 雙擊 Cmd 偵測註冊失敗。NSEvent 全域鍵盤監看以「輔助使用」為 gate（macOS 對已授權\n  \
+                 輔助使用者涵蓋輸入監控存取，raflow 不需獨立的 Input Monitoring）：\n  \
+                 open 'x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility'",
             ),
             RaflowError::ClipboardWrite { .. }
             | RaflowError::SpeechUnavailable { .. }
@@ -704,7 +705,7 @@ mod mac {
         let edit_terms = MenuItem::with_id(MENU_ID_EDIT_TERMS, "編輯自訂詞彙…", true, None);
         let edit_replacements =
             MenuItem::with_id(MENU_ID_EDIT_REPLACEMENTS, "編輯取代規則…", true, None);
-        let permissions_item = MenuItem::with_id(MENU_ID_PERMISSIONS, "權限檢查…", true, None);
+        let permissions_item = MenuItem::with_id(MENU_ID_PERMISSIONS, "診斷…", true, None);
         let restart_item = MenuItem::with_id(MENU_ID_RESTART, "重新啟動 raflow", true, None);
         let quit_item = MenuItem::with_id(QUIT_MENU_ID, "結束 raflow", true, None);
 
@@ -989,7 +990,7 @@ mod mac {
         //   - Accessibility：**靜默註冊**進「輔助使用」清單（不跳系統對話框，v0.1.7）——讓引導
         //     視窗成為唯一 AX 入口，避免「系統框 + 引導視窗」重複問同一權限、且互相堆疊。
         //     `launched_ax_trusted` 記錄啟動時是否已授權：若當時未授權（enigo 已快取 untrusted），
-        //     即使執行中授權也要**重啟 raflow** 才生效 → 供「權限檢查…」主動提議重啟。
+        //     即使執行中授權也要**重啟 raflow** 才生效 → 供診斷/自動偵測主動提議重啟。
         //   - Microphone：`NotDetermined` 時主動跳 prompt，避免首次錄音才被 cpal 惰性觸發、
         //     且被拒還靜默錄靜音（多位使用者回報的「有錄音卻沒字」盲區）。
         let launched_ax_trusted = register_silently();
@@ -1005,7 +1006,7 @@ mod mac {
             eprintln!("raflow: 權限檢查通過（麥克風 / 語音辨識 / 輔助使用皆已授權）。");
         } else {
             eprintln!(
-                "raflow: ⚠ 尚缺權限 {startup_missing:?} → 啟動後顯示引導視窗（可於 menu「權限檢查…」重開）。"
+                "raflow: ⚠ 尚缺權限 {startup_missing:?} → 啟動後顯示引導視窗（可於 menu「診斷…」重開）。"
             );
         }
         eprintln!("raflow: ready. double-tap Cmd to toggle recording. Quit from menu bar icon.");
@@ -1036,7 +1037,7 @@ mod mac {
         let mut pending_onboarding: Option<Vec<permissions::Permission>> =
             (!startup_missing.is_empty()).then_some(startup_missing);
         // v0.1.7：「輔助使用」授權自動偵測。啟動時未授權（enigo 已快取 untrusted、注入 stale）→ 每
-        // ~2s 輪詢 `is_trusted()`，一偵測到剛授權就**自動**跳重啟提議（免使用者自己去點「權限檢查…」）。
+        // ~2s 輪詢 `is_trusted()`，一偵測到剛授權就**自動**跳重啟提議（免使用者自己去點「診斷…」）。
         // 啟動時已授權則不輪詢（None）。授權後跳一次提議即停（無論接受與否）。
         const AX_POLL_INTERVAL: Duration = Duration::from_secs(2);
         let mut ax_poll_at: Option<Instant> =
@@ -1232,21 +1233,12 @@ mod mac {
                             // 成功靜默（對話框關掉＝完成）；出錯由 teach_correction 內部彈原生提示。
                             teach_correction(&recent_tokens);
                         } else if id == MENU_ID_PERMISSIONS {
-                            // 隨時重開權限引導：全綠時——若「輔助使用」是啟動後才授權（enigo 已快取
-                            // untrusted），提議重啟讓其生效；否則給確認提示。缺項則列出並可直達設定。
-                            let missing = permissions::capture_snapshot().missing();
-                            if missing.is_empty() {
-                                if !launched_ax_trusted {
-                                    // 啟動時未授權 AX、現在全綠 → 注入仍失效，需重啟。
-                                    if permissions::show_restart_offer() {
-                                        restart_raflow();
-                                    }
-                                } else {
-                                    permissions::show_all_granted();
-                                }
-                            } else {
-                                permissions::show_onboarding(&missing);
-                            }
+                            // 診斷讀表：麥克風／語音辨識／輔助使用／Whisper 模型／VAD 模型
+                            // 五項即時狀態（不含 Input Monitoring——被輔助使用涵蓋，見 permissions.rs）。
+                            // 「輔助使用」若為啟動後才授權（enigo 已快取 untrusted），顯示「需重啟」提示
+                            // ——使用者可用 menu「重新啟動 raflow」。有可由系統設定解決的缺項時，主按鈕
+                            // 直達第一個缺項的設定頁。
+                            permissions::show_diagnostics(!launched_ax_trusted);
                         } else if id == MENU_ID_RESTART {
                             restart_raflow();
                         }
@@ -1304,7 +1296,7 @@ mod mac {
                     RaflowError::HotkeyRegister {
                         detail: "in use".into(),
                     },
-                    "Input Monitoring",
+                    "輔助使用",
                 ),
             ];
             for (err, keyword) in cases {

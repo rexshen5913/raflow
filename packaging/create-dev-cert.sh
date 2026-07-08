@@ -20,6 +20,31 @@ if [[ ! -f "$LOGIN_KEYCHAIN" ]]; then
     LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain"
 fi
 
+# 設定私鑰的 partition list，讓 Apple 工具（codesign）能**非互動**存取私鑰。
+# 為什麼需要：`security import -A` 只設 legacy app-ACL；現代 macOS（Sierra+）另有
+# partition list 這道閘，未設時 CLI codesign 每次都彈 SecurityAgent 授權窗，背景/CI
+# 會 hang（曾害背景發佈苦等 45 分鐘、零產出）。設定後對此 keychain 內金鑰永久免彈窗。
+# 需 keychain 密碼：取自 $RAFLOW_KEYCHAIN_PW 或互動 TTY 提示；兩者皆無則**跳過並警告**
+# （不讓 cert 建立因此失敗；release.sh 的 ensure_codesign_ready 會再守一次）。
+set_partition_list() {
+    local pw="${RAFLOW_KEYCHAIN_PW:-}"
+    if [[ -z "$pw" && -t 0 ]]; then
+        read -rsp "  設定 codesign 免彈窗需登入 keychain 密碼（Enter 跳過）: " pw; echo
+    fi
+    if [[ -z "$pw" ]]; then
+        echo "  $(printf '\033[33mℹ\033[0m') 未提供 keychain 密碼，跳過 partition-list 設定"
+        echo "    （首次 codesign 會彈窗；一次性免彈窗修法見 scripts/release.sh 的 ensure_codesign_ready）"
+        return 0
+    fi
+    security unlock-keychain -p "$pw" "$LOGIN_KEYCHAIN" >/dev/null 2>&1 || true
+    if security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$LOGIN_KEYCHAIN" >/dev/null 2>&1; then
+        echo "  → partition-list 已設，codesign 可非互動存取私鑰"
+    else
+        echo "  $(printf '\033[33mℹ\033[0m') partition-list 設定未成功（密碼可能有誤），首次 codesign 仍可能彈窗"
+    fi
+    pw=""
+}
+
 # 把 cert 標為 user trust domain 的 codeSigning trusted root，使 macOS TCC 把
 # raflow-dev 簽章視為「合法簽章」而非等同 ad-hoc → 授權才能跨啟動持久化。
 # 此函式 idempotent；security 工具自身會跳過已存在的 trust setting。
@@ -42,6 +67,8 @@ if security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
     security find-certificate -c "$CERT_NAME" -p > "$EXISTING_PEM"
     echo "→ 確認 trust 設定..."
     trust_cert_for_codesigning "$EXISTING_PEM"
+    echo "→ 確認 codesign 免彈窗（partition-list）..."
+    set_partition_list
     exit 0
 fi
 
@@ -92,6 +119,9 @@ security import "$TMP_DIR/bundle.p12" \
 
 echo "→ 加入 user trust domain（讓 macOS 把此 cert 簽出來的 app 視為合法簽章）..."
 trust_cert_for_codesigning "$TMP_DIR/cert.pem"
+
+echo "→ 設定 partition-list（讓 codesign 非互動免彈窗）..."
+set_partition_list
 
 echo ""
 echo "✓ 已建立 '$CERT_NAME' 並匯入 login keychain"
