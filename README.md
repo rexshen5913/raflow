@@ -51,6 +51,22 @@ brew install --cask raflow
 - Apple Silicon（M1 以上）
 - macOS 13 Ventura 以上
 
+### 解除安裝
+
+```bash
+brew uninstall --cask raflow          # 移除 app（保留模型與設定，重裝不必重新下載）
+```
+
+若要連 Whisper 模型（約 550 MB）與你的設定（自訂詞彙 / 取代規則 / 偏好）一起徹底清除：
+
+```bash
+brew uninstall --zap --cask raflow
+```
+
+> 一般解除安裝會**保留** `~/Library/Application Support/raflow`（模型 + 設定），讓重裝不必重新下載模型。
+> macOS 的權限授權（麥克風 / 語音辨識 / 輔助使用 / 輸入監控）由系統管理，`--zap` 也不會動到；
+> 如需清除，到「系統設定 → 隱私權與安全性」移除，或執行 `tccutil reset All dev.raflow.raflow`。
+
 ## 首次執行權限
 
 raflow 需要以下權限（皆為功能必要，無任何資料外傳）：
