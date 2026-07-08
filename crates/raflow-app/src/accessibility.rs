@@ -30,7 +30,7 @@ use objc2_application_services::{
     kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFRetained, CFString, CFType, kCFBooleanTrue,
+    CFBoolean, CFDictionary, CFRetained, CFString, CFType, kCFBooleanFalse, kCFBooleanTrue,
 };
 use std::ptr::NonNull;
 
@@ -90,33 +90,40 @@ pub fn is_trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
-/// 啟動時呼叫一次：若沒拿到 Accessibility，主動觸發系統的「raflow 想要控制這台電腦…」
-/// dialog 並引導使用者去「系統設定 → 隱私權與安全性 → 輔助使用」打勾。回傳值同
-/// `is_trusted()`（呼叫當下是否已 trusted）。
-///
-/// **設計原因**：enigo 的 `CGEventPost` 在沒 Accessibility 時**靜默失敗不報錯**，
-/// 使用者會看到「menu bar 變紅但輸入框沒文字」這種完全沒線索的故障。Apple 提供的
-/// `AXIsProcessTrustedWithOptions(prompt: true)` 是業界標準解法：未授權時自動跳
-/// 系統 dialog，比我們自己 eprintln 引導文字有效得多。
-///
-/// **macOS 行為注意**：dialog 一個 process 生命週期只跳一次，因此本函式設計成「啟動時
-/// 呼叫一次」。後續執行期的查詢請用便宜的 `is_trusted()`（不再 prompt）。
-pub fn ensure_trusted_with_prompt() -> bool {
-    // SAFETY: kCFBooleanTrue / kAXTrustedCheckOptionPrompt 皆為 Apple 公開 ABI 提供的
-    // static singleton，跨進程 read-only 共享，任意執行緒讀取安全。kCFBooleanTrue 文件
-    // 保證非 NULL；kAXTrustedCheckOptionPrompt 在 macOS 10.9+ 一律存在。
-    // 兩者以 unsafe block 包裹是因為 extern static 在 Rust 2024 edition 強制 unsafe 讀取。
+/// 以 `AXIsProcessTrustedWithOptions` 查 AX 信任；`prompt` 控制是否跳系統對話框。
+/// **不論 `prompt` 真假，呼叫本身都會把 raflow 註冊進「系統設定 → 隱私權與安全性 → 輔助使用」
+/// 清單**（未勾選狀態）——這正是我們要的：靜默註冊、讓引導視窗當唯一入口。回傳當下是否已 trusted。
+fn trusted_with_options(prompt: bool) -> bool {
+    // SAFETY: kCFBooleanTrue / kCFBooleanFalse / kAXTrustedCheckOptionPrompt 皆為 Apple 公開 ABI
+    // 提供的 static singleton，跨進程 read-only 共享，任意執行緒讀取安全；文件保證非 NULL /
+    // 在 macOS 10.9+ 一律存在。extern static 在 Rust 2024 edition 強制 unsafe 讀取。
     // 避免 `unwrap()`（憲法 §3.1），採 if-let 並在罕見 None 情境降級到不 prompt 的查詢。
-    let Some(true_value): Option<&CFBoolean> = (unsafe { kCFBooleanTrue }) else {
+    let flag: Option<&CFBoolean> = if prompt {
+        unsafe { kCFBooleanTrue }
+    } else {
+        unsafe { kCFBooleanFalse }
+    };
+    let Some(flag) = flag else {
         return is_trusted();
     };
     let key: &CFString = unsafe { kAXTrustedCheckOptionPrompt };
-    let dict = CFDictionary::<CFString, CFBoolean>::from_slices(&[key], &[true_value]);
+    let dict = CFDictionary::<CFString, CFBoolean>::from_slices(&[key], &[flag]);
     // SAFETY: dict 為剛建立的有效 CFDictionary（CFRetained 持有所有權，至少存活到本
     // function 結束）；`as_opaque()` 回傳的 reference 與 dict 同生命週期。
     // AXIsProcessTrustedWithOptions 為 Apple public ABI，文件保證任意執行緒可呼叫；
     // 對 Option<&CFDictionary> 接受 Some/None。
     unsafe { AXIsProcessTrustedWithOptions(Some(dict.as_opaque())) }
+}
+
+/// 啟動時呼叫一次：把 raflow **靜默註冊**進「系統設定 → 輔助使用」清單（**不跳**系統對話框），
+/// 讓權限引導視窗（`permissions.rs`）成為唯一的 Accessibility 引導入口——避免「系統框 + 引導
+/// 視窗」重複問同一個權限、且互相堆疊（v0.1.7 修正）。回傳當下是否已 trusted。
+///
+/// **為何不再跳系統 prompt**：enigo 的 `CGEventPost` 沒 Accessibility 時靜默失敗，原本靠系統
+/// prompt 引導；但改用可見的引導視窗後，系統 prompt 反而與其重複。靜默註冊（`prompt: false`）
+/// 保留「app 出現在輔助使用清單可勾選」的效果，去掉重複的系統對話框。
+pub fn register_silently() -> bool {
+    trusted_with_options(false)
 }
 
 /// 目前前景（focused）app 的 PID。供注入焦點守衛（`raflow_input::FocusGuard`，
@@ -231,12 +238,12 @@ fn is_attr_settable(el: &AXUIElement, name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// `ensure_trusted_with_prompt()` 至少要能 build + 跑得起來不 panic。系統 TCC
-    /// 狀態相依的回傳值在 CI / 本機可能不同，所以不 assert 結果；只驗證 FFI path 是通的
-    /// （CFDictionary 建構、kCFBooleanTrue 取用、AXIsProcessTrustedWithOptions 呼叫）。
+    /// `register_silently()` 至少要能 build + 跑得起來不 panic。系統 TCC 狀態相依的回傳值在
+    /// CI / 本機可能不同，所以不 assert 結果；只驗證 FFI path 是通的（CFDictionary 建構、
+    /// kCFBooleanFalse 取用、AXIsProcessTrustedWithOptions(prompt:false) 呼叫）。
     #[test]
-    fn ensure_trusted_with_prompt_smoke() {
-        let _ = ensure_trusted_with_prompt();
+    fn register_silently_smoke() {
+        let _ = register_silently();
     }
 
     /// `frontmost_app_pid()` 的 FFI path 要能跑不 panic。回傳值依 TCC 狀態與當下

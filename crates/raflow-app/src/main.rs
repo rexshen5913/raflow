@@ -41,7 +41,7 @@ mod settings;
 #[cfg(target_os = "macos")]
 mod mac {
     use crate::accessibility::{
-        FocusDetection, detect_focus, ensure_trusted_with_prompt, frontmost_app_pid,
+        FocusDetection, detect_focus, frontmost_app_pid, is_trusted, register_silently,
     };
     use crate::floating_overlay::FloatingOverlay;
     use crate::permissions;
@@ -79,6 +79,8 @@ mod mac {
     const MENU_ID_TEACH_CORRECTION: &str = "edit.teach_correction";
     /// 「權限檢查…」：隨時重開首次啟動的權限引導（ADR-0008 / app.md §9.2）。
     const MENU_ID_PERMISSIONS: &str = "permissions.check";
+    /// 「重新啟動 raflow」：授權輔助使用後需重啟才生效（enigo 快取，v0.1.7）。
+    const MENU_ID_RESTART: &str = "app.restart";
     /// 「最近注入英文 token」候選緩衝保留的句數（供更正 popover 的「聽成」下拉）。
     const RECENT_TOKENS_CAP: usize = 5;
     /// Whisper 餵的語言：強制 `zh` 中文 tokenizer，避免使用者反映的「偶爾出現韓文」
@@ -151,6 +153,31 @@ mod mac {
         if let Some(hint) = permission_hint(err) {
             eprintln!("{hint}");
         }
+    }
+
+    /// 重新啟動 raflow：授權「輔助使用」後 enigo 需重啟才生效（v0.1.7）。用 `open` 重開自身
+    /// `.app` bundle（非 bundle 則重跑 binary），延遲 1s 讓舊行程先退出（避免同 bundle 第二實例
+    /// 被 launchd 擋），然後 `exit(0)`。路徑以位置參數 `$1` 傳入 `sh`，免去引號跳脫問題。
+    fn restart_raflow() -> ! {
+        use std::process::Command;
+        if let Ok(exe) = std::env::current_exe() {
+            // exe = …/raflow.app/Contents/MacOS/raflow → 上溯 3 層 = …/raflow.app
+            let bundle = exe
+                .ancestors()
+                .nth(3)
+                .filter(|p| p.extension().is_some_and(|e| e == "app"));
+            let _ = match bundle {
+                Some(app) => Command::new("sh")
+                    .args(["-c", "sleep 1 && open \"$1\"", "sh"])
+                    .arg(app)
+                    .spawn(),
+                None => Command::new("sh")
+                    .args(["-c", "sleep 1 && \"$1\"", "sh"])
+                    .arg(&exe)
+                    .spawn(),
+            };
+        }
+        std::process::exit(0);
     }
 
     fn build_current_thread_rt() -> Result<tokio::runtime::Runtime, RaflowError> {
@@ -678,6 +705,7 @@ mod mac {
         let edit_replacements =
             MenuItem::with_id(MENU_ID_EDIT_REPLACEMENTS, "編輯取代規則…", true, None);
         let permissions_item = MenuItem::with_id(MENU_ID_PERMISSIONS, "權限檢查…", true, None);
+        let restart_item = MenuItem::with_id(MENU_ID_RESTART, "重新啟動 raflow", true, None);
         let quit_item = MenuItem::with_id(QUIT_MENU_ID, "結束 raflow", true, None);
 
         menu.append(&version_item).map_err(menu_err)?;
@@ -693,6 +721,7 @@ mod mac {
         menu.append(&PredefinedMenuItem::separator())
             .map_err(menu_err)?;
         menu.append(&permissions_item).map_err(menu_err)?;
+        menu.append(&restart_item).map_err(menu_err)?;
         menu.append(&quit_item).map_err(menu_err)?;
 
         // Idle icon 走 template（黑白剪影，由 macOS 依 menu bar 明暗 tint）；
@@ -957,11 +986,13 @@ mod mac {
 
         // 首次啟動權限引導（ADR-0008 / app.md §9.2）：主動請求三道權限，缺項則彈**看得見**的
         // 原生引導視窗（取代舊版只有 stderr、Finder 啟動看不到的提示）。
-        //   - Accessibility：`AXIsProcessTrustedWithOptions(prompt: true)`，一個 process 只跳一次。
-        //     enigo 的 CGEventPost 沒此權限時「靜默 no-op」不回錯誤，故必須主動引導。
+        //   - Accessibility：**靜默註冊**進「輔助使用」清單（不跳系統對話框，v0.1.7）——讓引導
+        //     視窗成為唯一 AX 入口，避免「系統框 + 引導視窗」重複問同一權限、且互相堆疊。
+        //     `launched_ax_trusted` 記錄啟動時是否已授權：若當時未授權（enigo 已快取 untrusted），
+        //     即使執行中授權也要**重啟 raflow** 才生效 → 供「權限檢查…」主動提議重啟。
         //   - Microphone：`NotDetermined` 時主動跳 prompt，避免首次錄音才被 cpal 惰性觸發、
         //     且被拒還靜默錄靜音（多位使用者回報的「有錄音卻沒字」盲區）。
-        let _ = ensure_trusted_with_prompt();
+        let launched_ax_trusted = register_silently();
         if !permissions::microphone_granted() {
             let rt = build_current_thread_rt()?;
             let granted = rt.block_on(permissions::request_microphone());
@@ -1004,10 +1035,17 @@ mod mac {
         // 待彈的權限引導：於 `StartCause::Init`（tray 建好後）take 一次顯示。
         let mut pending_onboarding: Option<Vec<permissions::Permission>> =
             (!startup_missing.is_empty()).then_some(startup_missing);
+        // v0.1.7：「輔助使用」授權自動偵測。啟動時未授權（enigo 已快取 untrusted、注入 stale）→ 每
+        // ~2s 輪詢 `is_trusted()`，一偵測到剛授權就**自動**跳重啟提議（免使用者自己去點「權限檢查…」）。
+        // 啟動時已授權則不輪詢（None）。授權後跳一次提議即停（無論接受與否）。
+        const AX_POLL_INTERVAL: Duration = Duration::from_secs(2);
+        let mut ax_poll_at: Option<Instant> =
+            (!launched_ax_trusted).then(|| Instant::now() + AX_POLL_INTERVAL);
 
         event_loop.run(move |event, _target, control_flow| {
-            // 預設 wait；若有 pending hide 則 wait 到指定時間醒來收尾
-            *control_flow = match overlay_hide_at {
+            // 預設 wait；overlay 收尾與 AX 輪詢各有排程 → 取最早的醒來時間。
+            let next_wake = [overlay_hide_at, ax_poll_at].into_iter().flatten().min();
+            *control_flow = match next_wake {
                 Some(at) => ControlFlow::WaitUntil(at),
                 None => ControlFlow::Wait,
             };
@@ -1038,6 +1076,19 @@ mod mac {
                                 o.hide();
                             }
                             overlay_hide_at = None;
+                        }
+                    }
+                    // AX 授權自動偵測：一偵測到剛授權（啟動時未授權 → 現已 trusted），自動跳重啟提議。
+                    if let Some(at) = ax_poll_at {
+                        if Instant::now() >= at {
+                            if is_trusted() {
+                                ax_poll_at = None; // 授權到手 → 停止輪詢、跳一次提議
+                                if permissions::show_restart_offer() {
+                                    restart_raflow();
+                                }
+                            } else {
+                                ax_poll_at = Some(Instant::now() + AX_POLL_INTERVAL);
+                            }
                         }
                     }
                 }
@@ -1181,13 +1232,23 @@ mod mac {
                             // 成功靜默（對話框關掉＝完成）；出錯由 teach_correction 內部彈原生提示。
                             teach_correction(&recent_tokens);
                         } else if id == MENU_ID_PERMISSIONS {
-                            // 隨時重開權限引導：全綠給確認提示，否則列出剩餘缺項並可直達設定。
+                            // 隨時重開權限引導：全綠時——若「輔助使用」是啟動後才授權（enigo 已快取
+                            // untrusted），提議重啟讓其生效；否則給確認提示。缺項則列出並可直達設定。
                             let missing = permissions::capture_snapshot().missing();
                             if missing.is_empty() {
-                                permissions::show_all_granted();
+                                if !launched_ax_trusted {
+                                    // 啟動時未授權 AX、現在全綠 → 注入仍失效，需重啟。
+                                    if permissions::show_restart_offer() {
+                                        restart_raflow();
+                                    }
+                                } else {
+                                    permissions::show_all_granted();
+                                }
                             } else {
                                 permissions::show_onboarding(&missing);
                             }
+                        } else if id == MENU_ID_RESTART {
+                            restart_raflow();
                         }
                     }
                 },

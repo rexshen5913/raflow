@@ -104,8 +104,18 @@ pub fn onboarding_body(missing: &[Permission]) -> Option<String> {
     }
     body.push_str(
         "\n\n點「開啟系統設定」會直接跳到第一項的設定頁；在清單裡把 raflow 打勾即可。\n\
-         改完可從 menu bar 圖示 →「權限檢查…」再次確認剩下幾項。\n\n\
-         （若雙擊 Cmd 完全沒反應，是「輸入監控 Input Monitoring」未授權，同樣在\
+         改完可從 menu bar 圖示 →「權限檢查…」再次確認剩下幾項。",
+    );
+    // 輔助使用特別：enigo 在啟動時就快取了授權狀態，執行中才授權**不會生效**，必須重啟 raflow。
+    // 這是 macOS 對 Accessibility 的行為，其他權限不受影響。
+    if missing.contains(&Permission::Accessibility) {
+        body.push_str(
+            "\n\n⚠ 「輔助使用」授權後，請從 menu →「重新啟動 raflow」重啟一次才會生效\
+             （其他權限即時生效、不用重啟）。",
+        );
+    }
+    body.push_str(
+        "\n\n（若雙擊 Cmd 完全沒反應，是「輸入監控 Input Monitoring」未授權，同樣在\
          「隱私權與安全性」裡開啟。）",
     );
     Some(body)
@@ -216,6 +226,8 @@ pub fn show_onboarding(missing: &[Permission]) {
 
     if response == NSAlertFirstButtonReturn {
         if let Some(first) = missing.first() {
+            // 直接開設定頁即可——啟動時 `register_silently()`（prompt:false）已把 raflow 註冊進
+            // 「輔助使用」清單（實機驗證：清單中確有 raflow），故不需再跳系統 AX 框。
             open_settings(first.settings_url());
         }
     }
@@ -227,6 +239,38 @@ pub fn show_all_granted() {
         "權限都已就緒",
         "麥克風、語音辨識、輔助使用都已授權，raflow 可以正常聽寫。",
     );
+}
+
+/// 「輔助使用剛授權、但 enigo 已快取啟動時的未授權狀態」時的重啟提議。回傳使用者是否選擇立即重啟。
+/// 只能主執行緒呼叫（`MainThreadMarker` 強制，非主執行緒安靜跳過回 false）。
+pub fn show_restart_offer() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
+    };
+    use objc2_foundation::NSString;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("需要重新啟動 raflow"));
+    alert.setInformativeText(&NSString::from_str(
+        "「輔助使用」已授權，但要**重新啟動 raflow** 才會生效（macOS 對 Accessibility 的行為：\
+         啟動後才授權不會即時套用）。重啟前文字仍可用 Cmd+V 從剪貼簿貼上。",
+    ));
+    alert.addButtonWithTitle(&NSString::from_str("立即重新啟動"));
+    alert.addButtonWithTitle(&NSString::from_str("稍後"));
+
+    let app = NSApplication::sharedApplication(mtm);
+    let prev_policy = app.activationPolicy();
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    let response = crate::correction_popover::run_alert_on_active_screen(&alert, mtm);
+    app.setActivationPolicy(prev_policy);
+
+    response == NSAlertFirstButtonReturn
 }
 
 /// 以 macOS `open` 開啟系統設定深連結。失敗只記 log（引導本身已顯示，非致命）。
@@ -287,6 +331,19 @@ mod tests {
     fn onboarding_body_none_when_all_granted() {
         assert!(onboarding_body(&[]).is_none());
         assert!(snap(true, true, true).missing().is_empty());
+    }
+
+    #[test]
+    fn onboarding_body_restart_note_only_when_accessibility_missing() {
+        // 缺輔助使用 → 內文含「重新啟動」提示（enigo 快取，授權後需重啟才生效）。
+        let with_ax = onboarding_body(&[Permission::Accessibility]).unwrap_or_default();
+        assert!(with_ax.contains("重新啟動 raflow"), "缺輔助使用應提示重啟");
+        // 只缺麥克風 → 不該有重啟提示（其他權限即時生效）。
+        let without_ax = onboarding_body(&[Permission::Microphone]).unwrap_or_default();
+        assert!(
+            !without_ax.contains("重新啟動 raflow"),
+            "非輔助使用缺項不該提示重啟"
+        );
     }
 
     #[test]

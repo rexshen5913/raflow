@@ -647,6 +647,11 @@ mod mac {
             // 的活動監看能自我濾除 raflow 自身注入的按鍵（見 raflow_core::RAFLOW_INJECT_MARKER）。
             let settings = Settings {
                 event_source_user_data: Some(raflow_core::RAFLOW_INJECT_MARKER),
+                // 不讓 enigo 在 `Enigo::new()` 時自己跳「輔助使用」系統授權框（預設 true）——否則會
+                // 與 raflow 的權限引導視窗**重複問同一權限、且與麥克風 prompt 堆疊**（使用者實測回報）。
+                // 改由引導視窗當唯一 AX 入口：`accessibility::register_silently()`（prompt:false）靜默
+                // 註冊進「輔助使用」清單（實機已確認清單中有 raflow），按鈕只開系統設定頁，不用 prompt:true。
+                open_prompt_to_get_permissions: false,
                 ..Settings::default()
             };
             let enigo = Enigo::new(&settings).map_err(|e| RaflowError::TextInject {
