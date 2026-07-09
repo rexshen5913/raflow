@@ -64,7 +64,7 @@ brew uninstall --zap --cask raflow
 ```
 
 > 一般解除安裝會**保留** `~/Library/Application Support/raflow`（模型 + 設定），讓重裝不必重新下載模型。
-> macOS 的權限授權（麥克風 / 語音辨識 / 輔助使用 / 輸入監控）由系統管理，`--zap` 也不會動到；
+> macOS 的權限授權（麥克風 / 語音辨識 / 輔助使用）由系統管理，`--zap` 也不會動到；
 > 如需清除，到「系統設定 → 隱私權與安全性」移除，或執行 `tccutil reset All dev.raflow.raflow`。
 
 ## 首次執行權限
@@ -75,11 +75,13 @@ raflow 需要以下權限（皆為功能必要，無任何資料外傳）：
 |---|---|
 | 語音辨識（Speech Recognition） | Apple Speech 即時辨識 |
 | 麥克風（Microphone） | 擷取語音 |
-| 輸入監控（Input Monitoring） | 偵測雙擊 Cmd 快捷鍵 |
-| 輔助使用（Accessibility） | 將文字注入目前的輸入框 |
+| 輔助使用（Accessibility） | 偵測雙擊 Cmd 快捷鍵 + 將文字注入目前的輸入框 |
 
-前兩項會自動彈窗引導；後兩項若未彈窗，請至
-**系統設定 → 隱私權與安全性** 手動勾選 raflow。
+前兩項會自動彈窗引導；輔助使用若未彈窗，請至
+**系統設定 → 隱私權與安全性 → 輔助使用** 手動勾選 raflow。
+
+> raflow **不需要單獨開「輸入監控」**：雙擊 Cmd 偵測與文字注入都以輔助使用為 gate，
+> macOS 對已授權輔助使用的 app 會一併涵蓋全域鍵盤監看，raflow 從不獨立出現在「輸入監控」清單。
 
 ## 使用方式
 
