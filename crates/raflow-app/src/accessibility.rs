@@ -12,12 +12,14 @@
 //!
 //! ## 偵測邏輯（三狀態）
 //!
-//! 1. **`Untrusted`**：raflow 沒拿到 macOS Accessibility 權限——AX API 全部 disabled。
-//!    enigo 走 CGEventPost（只需 Input Monitoring），所以 inject 仍能用，但 AX query
-//!    一律 fail。**此情境視為 editable**（panel 不彈），避免在 inject 已成功的場景多
-//!    疊一個面板擾人；同時 stderr 提示去開權限。
-//! 2. **`Unknown`**：有權限但 query 不到 focused element（極少見：focus 在 menu /
-//!    系統元件 / race condition）。**視為非 editable**，彈 panel 作安全網。
+//! 1. **`Untrusted`**：raflow 沒拿到 macOS Accessibility 權限——AX API 全部 disabled，
+//!    且 `EnigoBackend::new()` 於初始化即失敗 → 直注整條停用（見 spec/input.md §5/§6），
+//!    此時只剩 clipboard 保底（Cmd+V）。**panel 仍抑制**（對已停用的直注再彈面板無意義），
+//!    stderr 提示去開權限並重啟 raflow。
+//! 2. **`Unknown`**：有權限但雙路查詢都拿不到 focused element，多為 Electron／隱藏 AX tree
+//!    的 app（ChatGPT desktop / Slack / Discord 等）。視為「較可能是輸入框」（使用者主要對輸入框
+//!    講話）→ **抑制 panel**；實測這類場景 inject 多半工作，panel 跑出來反而與其雙重顯示干擾，
+//!    clipboard 保底（Cmd+V）仍在。只有明確 `Detected{editable=false}` 才彈。
 //! 3. **`Detected`**：query 成功，依雙重訊號判斷：
 //!    - **AXRole** 命中 [`EDITABLE_ROLES`] → editable（cover 原生 AppKit / Safari / 多數 web）
 //!    - **AXSelectedTextRange** 屬性 settable → editable（fallback；該屬性只存在於可
@@ -65,7 +67,7 @@ pub enum FocusDetection {
 
 impl FocusDetection {
     /// 是否抑制 floating panel。
-    /// - `Untrusted` → true（沒 Accessibility 權限；inject 仍能用，panel 多餘）
+    /// - `Untrusted` → true（沒 Accessibility 權限；直注 backend 初始化失敗、整條停用，只剩 clipboard 保底，panel 多餘）
     /// - `Unknown` → true（Electron / 隱藏 AX tree 的 app；實測這類場景 inject 多半工作，
     ///   panel 跑出來反而干擾）
     /// - `Detected` → 依 `editable`（明確判斷後才決定）
@@ -267,8 +269,8 @@ mod tests {
     }
 
     /// FocusDetection.suppresses_panel 三狀態語意：
-    /// - Untrusted → 抑制 panel（沒權限時 inject 已能用，不要疊 panel 吵）
-    /// - Unknown → 不抑制（panel 作安全網）
+    /// - Untrusted → 抑制 panel（沒權限時直注 backend 初始化失敗、整條停用，只剩 clipboard 保底，panel 多餘）
+    /// - Unknown → 抑制（Electron／隱藏 AX tree，視為較可能是輸入框，inject 多半工作）
     /// - Detected(editable=true) → 抑制；Detected(editable=false) → 不抑制
     #[test]
     fn suppresses_panel_decision_table() {

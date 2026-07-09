@@ -1101,7 +1101,7 @@ mod mac {
                             let _ = tray.set_icon(Some(recording_icon.clone()));
                         }
                         // Edit Guard：本次錄音啟動使用者接管監看（滑鼠/導覽鍵）。權限不足
-                        // （Input Monitoring 未授予）→ 監看註冊失敗，僅記 log，不阻斷錄音。
+                        // （輔助使用未授予——與雙擊 Cmd 同一 gate，非 Input Monitoring）→ 監看註冊失敗，僅記 log，不阻斷錄音。
                         match raflow_hotkey::register_activity_monitor(activity_tx.clone()) {
                             // replace → 舊 handle（若有）在此 drop=removeMonitor，存新 handle。
                             Ok(handle) => {
@@ -1120,8 +1120,8 @@ mod mac {
                         session_focused_in_text_input = detection.suppresses_panel();
                         match &detection {
                             FocusDetection::Untrusted => eprintln!(
-                                "raflow: session focus = untrusted (no Accessibility permission; panel suppressed to avoid stacking with inject)\n  \
-                                 → 開啟系統設定 → 隱私權與安全性 → 輔助使用 → 加入 raflow.app 並打勾",
+                                "raflow: session focus = untrusted (no Accessibility permission; text injection disabled at init, only clipboard fallback works via Cmd+V; panel suppressed)\n  \
+                                 → 開啟系統設定 → 隱私權與安全性 → 輔助使用 → 加入 raflow.app 並打勾，然後重啟 raflow",
                             ),
                             FocusDetection::Unknown => eprintln!(
                                 "raflow: session focus = unknown (AX granted but no focused element; likely Electron / hidden AX tree → panel suppressed, clipboard fallback still works via Cmd+V)",
